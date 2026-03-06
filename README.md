@@ -62,9 +62,46 @@ python3 main.py /Users/didi/work/sdk-env/navi-engine-v2/RGMap/RGMap/business/Cas
 
 结果文件：`/tmp/code_scan_single_cpp.txt`
 
-## 5. 环境变量
+## 5. Diff 扫描（只扫改动）
 
-### 5.1 DeepSeek
+### 5.1 扫当前工作区改动（staged + unstaged）
+
+```bash
+cd /Users/didi/work/sdk-env/code_scan_agent
+export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
+export DEEPSEEK_API_KEY="你的 key"
+python3 main.py /path/to/repo --mode diff > /tmp/code_scan_diff_report.txt
+```
+
+### 5.2 扫两个 ref 之间的改动（PR 场景）
+
+```bash
+python3 main.py /path/to/repo --mode diff --diff-base-ref origin/main --diff-head-ref HEAD > /tmp/code_scan_diff_report.txt
+```
+
+只传 `--diff-base-ref` 时，默认比较 `base...HEAD`。
+
+### 5.3 扫某一个 commit 引入的改动
+
+```bash
+python3 main.py /path/to/repo --mode diff --diff-commit 2492cad > /tmp/code_scan_diff_report.txt
+```
+
+`--diff-commit` 不能与 `--diff-base-ref/--diff-head-ref` 同时使用。
+
+### 5.4 只保留“命中改动行”的 findings
+
+```bash
+export DIFF_FINDINGS_FILTER=only
+python3 main.py /path/to/repo --mode diff > /tmp/code_scan_diff_report.txt
+```
+
+默认 `DIFF_FINDINGS_FILTER=mark`：会给 finding 打 `in_diff=true/false`，但不丢弃非改动行。
+默认 `DIFF_ENABLE_LLM=0`：diff 模式下只做本地 triage（更快更稳定）。
+
+## 6. 环境变量
+
+### 6.1 DeepSeek
 
 - `DEEPSEEK_API_KEY`: 必填
 - `DEEPSEEK_MODEL`: 默认 `deepseek-chat`
@@ -75,7 +112,7 @@ python3 main.py /Users/didi/work/sdk-env/navi-engine-v2/RGMap/RGMap/business/Cas
 - `DEEPSEEK_RETRY`: DeepSeek 失败后的重试次数（默认 `1`）
 - `DEEPSEEK_RETRY_BACKOFF_SEC`: 重试退避秒数基准（默认 `1.0`）
 
-### 5.2 C++ 扫描
+### 6.2 C++ 扫描
 
 - `CLANG_TIDY_TIMEOUT_SEC`: `clang-tidy` 单文件超时（默认 `60`）
 - `CLANG_TIDY_EXTRA_ARGS`: 额外参数
@@ -85,7 +122,7 @@ python3 main.py /Users/didi/work/sdk-env/navi-engine-v2/RGMap/RGMap/business/Cas
 - `CPP_SCAN_MAX_FILES`: C++ 最大扫描文件数，`0` 表示不限制
 - `CPP_THIRD_PARTY_EXCLUDES`: 额外三方目录前缀，逗号分隔
 
-### 5.3 Semgrep
+### 6.3 Semgrep
 
 - `SEMGREP_CONFIG`: 默认 `p/security-audit`
 - `SEMGREP_METRICS`: `on/off/auto`，默认规则见代码
@@ -93,9 +130,19 @@ python3 main.py /Users/didi/work/sdk-env/navi-engine-v2/RGMap/RGMap/business/Cas
 - `SEMGREP_RULE_TIMEOUT_SEC`: 单规则超时（默认 `15`）
 - `SEMGREP_EXTRA_ARGS`: 额外参数
 
-## 6. 常见问题
+### 6.4 Diff 模式
 
-### 6.1 `llm_triage: DeepSeek failed ... timed out`
+- `DIFF_BASE_REF`: 等价于 `--diff-base-ref`
+- `DIFF_HEAD_REF`: 等价于 `--diff-head-ref`
+- `DIFF_COMMIT`: 等价于 `--diff-commit`
+- `DIFF_STAGED`: `1` 表示只看 staged 变更（当未指定 base/head 时）
+- `GIT_DIFF_TIMEOUT_SEC`: git diff 超时（默认 `30`）
+- `DIFF_FINDINGS_FILTER`: `mark` 或 `only`（默认 `mark`）
+- `DIFF_ENABLE_LLM`: diff 模式是否启用 DeepSeek 分诊（默认 `0`，设置 `1` 开启）
+
+## 7. 常见问题
+
+### 7.1 `llm_triage: DeepSeek failed ... timed out`
 
 说明 DeepSeek 接口在当前超时窗口内没有返回。可调：
 
@@ -104,13 +151,13 @@ export DEEPSEEK_TIMEOUT_SEC=180
 export DEEPSEEK_TRIAGE_MAX_ITEMS=20
 ```
 
-### 6.2 `clang-tidy not found in PATH`
+### 7.2 `clang-tidy not found in PATH`
 
 ```bash
 export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
 ```
 
-### 6.3 `semgrep` 无结果或报配置错误
+### 7.3 `semgrep` 无结果或报配置错误
 
 建议使用显式规则集：
 

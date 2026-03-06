@@ -577,20 +577,20 @@ def run_cpp_scanners(state: GraphState) -> GraphState:
         )
         state.setdefault("logs", []).extend([f"run_cpp_scanners detail: {x}" for x in compile_db_logs])
         if compile_db_units:
-            if mode == "selected":
+            if mode in {"selected", "diff"}:
                 selected_set = set(target_cpp_files)
                 intersect_units = [p for p in compile_db_units if p in selected_set]
                 if intersect_units:
                     cpp_files = intersect_units
                     state.setdefault("logs", []).append(
                         "run_cpp_scanners: using compile_db intersection "
-                        f"units={len(cpp_files)} (selected_targets={len(target_cpp_files)})"
+                        f"units={len(cpp_files)} ({mode}_targets={len(target_cpp_files)})"
                     )
                 else:
                     cpp_files = target_cpp_files
                     state.setdefault("logs", []).append(
-                        "run_cpp_scanners: selected mode has no compile_db intersection, "
-                        f"fallback to selected_targets={len(target_cpp_files)}"
+                        f"run_cpp_scanners: {mode} mode has no compile_db intersection, "
+                        f"fallback to {mode}_targets={len(target_cpp_files)}"
                     )
             else:
                 cpp_files = compile_db_units
@@ -636,9 +636,11 @@ def run_cpp_scanners(state: GraphState) -> GraphState:
     total_duration_ms += clang_ms
 
     # 2) cppcheck
-    cppcheck_compile_db = compile_db_path if mode != "selected" else None
-    if mode == "selected" and compile_db_path:
-        state.setdefault("logs", []).append("run_cpp_scanners: selected mode -> cppcheck uses explicit file list")
+    cppcheck_compile_db = compile_db_path if mode not in {"selected", "diff"} else None
+    if mode in {"selected", "diff"} and compile_db_path:
+        state.setdefault("logs", []).append(
+            f"run_cpp_scanners: {mode} mode -> cppcheck uses explicit file list"
+        )
 
     cppcheck_findings, cppcheck_logs, cppcheck_ms = _run_cppcheck(
         repo_path=repo_path,

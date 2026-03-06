@@ -248,6 +248,39 @@ def _extract_tool_name(tool_result_tool_field: str, raw: dict[str, Any]) -> str:
     return str(tool_result_tool_field or "unknown")
 
 
+def _get_diff_filter_mode(state: GraphState) -> str:
+    request = state.get("request", {})
+    raw = request.get("diff_findings_filter") or os.getenv("DIFF_FINDINGS_FILTER", "mark")
+    mode = str(raw).strip().lower()
+    return mode if mode in {"mark", "only"} else "mark"
+
+
+def _build_diff_line_index(state: GraphState, repo_root: Path) -> dict[str, set[int]]:
+    line_index: dict[str, set[int]] = {}
+    for target in state.get("targets", []):
+        file_path = _normalize_path(repo_root, str(target.get("path") or ""))
+        if not file_path:
+            continue
+
+        raw_lines = target.get("changed_lines") or []
+        if not isinstance(raw_lines, list):
+            continue
+
+        lines: set[int] = set()
+        for raw in raw_lines:
+            try:
+                line = int(raw)
+            except Exception:
+                continue
+            if line > 0:
+                lines.add(line)
+
+        if lines:
+            line_index.setdefault(file_path, set()).update(lines)
+
+    return line_index
+
+
 def normalize_findings(state: GraphState) -> GraphState:
     repo = state.get("repo_profile")
     if not repo:
@@ -255,9 +288,14 @@ def normalize_findings(state: GraphState) -> GraphState:
         return state
 
     repo_root = Path(repo["repo_path"]).resolve()
+    request = state.get("request", {})
+    scan_mode = str(request.get("mode", "full"))
+    diff_filter_mode = _get_diff_filter_mode(state)
+    diff_line_index = _build_diff_line_index(state, repo_root) if scan_mode == "diff" else {}
 
     normalized: list[Finding] = []
     dropped = 0
+    diff_filtered = 0
 
     for tool_result in state.get("raw_tool_results", []):
         language = str(tool_result.get("language") or "unknown")
@@ -279,18 +317,38 @@ def normalize_findings(state: GraphState) -> GraphState:
                 dropped += 1
                 continue
 
-            normalized.append(
-                _normalize_one_raw(
-                    repo_root=repo_root,
-                    language=language,
-                    tool=tool,
-                    raw=raw,
-                )
+            finding = _normalize_one_raw(
+                repo_root=repo_root,
+                language=language,
+                tool=tool,
+                raw=raw,
             )
+            if scan_mode == "diff":
+                file_path = str(finding.get("file") or "")
+                line = finding.get("line")
+                in_diff = bool(
+                    file_path
+                    and isinstance(line, int)
+                    and line > 0
+                    and line in diff_line_index.get(file_path, set())
+                )
+                finding["in_diff"] = in_diff
+                if diff_filter_mode == "only" and not in_diff:
+                    diff_filtered += 1
+                    continue
+
+            normalized.append(finding)
 
     # 额外：对明显无 file 的 Finding 也保留，但你也可以在这里过滤
     state["normalized_findings"] = normalized
-    state.setdefault("logs", []).append(
-        f"normalize_findings(enhanced): normalized={len(normalized)}, dropped={dropped}"
-    )
+    if scan_mode == "diff":
+        state.setdefault("logs", []).append(
+            "normalize_findings(enhanced): "
+            f"normalized={len(normalized)}, dropped={dropped}, diff_filtered={diff_filtered}, "
+            f"diff_files={len(diff_line_index)}, diff_filter={diff_filter_mode}"
+        )
+    else:
+        state.setdefault("logs", []).append(
+            f"normalize_findings(enhanced): normalized={len(normalized)}, dropped={dropped}"
+        )
     return state

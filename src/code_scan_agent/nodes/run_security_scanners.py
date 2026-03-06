@@ -148,6 +148,25 @@ def _build_semgrep_cmd(repo_path: Path, state: GraphState) -> list[str]:
                 cmd.append(str(rel))
             except ValueError:
                 continue
+    elif mode == "diff":
+        seen: set[str] = set()
+        for t in state.get("targets", []):
+            raw_path = str(t.get("path") or "").strip()
+            if not raw_path:
+                continue
+            p_obj = Path(raw_path)
+            if not p_obj.is_absolute():
+                p_obj = repo_path / p_obj
+            try:
+                rel = str(p_obj.resolve().relative_to(repo_path))
+            except ValueError:
+                continue
+            if rel in seen:
+                continue
+            seen.add(rel)
+            cmd.append(rel)
+        if not seen:
+            cmd.append(".")
     else:
         cmd.append(".")
 
@@ -167,6 +186,24 @@ def run_security_scanners(state: GraphState) -> GraphState:
 
     repo_path = Path(repo_path_str).resolve()
     raw_results = state.setdefault("raw_tool_results", [])
+    request = state.get("request", {})
+    mode = request.get("mode", "full")
+
+    if mode == "diff" and not state.get("targets"):
+        raw_results.append(
+            {
+                "tool": "semgrep",
+                "language": "mixed",
+                "success": True,
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+                "duration_ms": 0,
+                "raw_findings": [],
+            }
+        )
+        state.setdefault("logs", []).append("run_security_scanners: skipped (diff mode no targets)")
+        return state
 
     if not is_command_available("semgrep"):
         raw_results.append(

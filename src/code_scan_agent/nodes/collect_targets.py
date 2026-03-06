@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 from fnmatch import fnmatch
 from pathlib import Path
 
 from code_scan_agent.graph.state import GraphState
+from code_scan_agent.tools.repo.git_diff import collect_git_diff_changed_lines
 
 
 _EXT_TO_LANG = {
@@ -32,6 +34,14 @@ def _match_globs(rel_path: str, patterns: list[str]) -> bool:
     return any(fnmatch(rel_path, p) for p in patterns)
 
 
+def _parse_bool(raw: object, default: bool = False) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
 def collect_targets(state: GraphState) -> GraphState:
     repo = state.get("repo_profile")
     if not repo:
@@ -48,6 +58,7 @@ def collect_targets(state: GraphState) -> GraphState:
     include_globs = list(request.get("include_globs", []))
     exclude_globs = list(request.get("exclude_globs", []))
     selected_paths = list(request.get("selected_paths", []))
+    diff_changed_lines: dict[str, list[int]] = {}
 
     selected_set: set[str] = set()
     for p in selected_paths:
@@ -61,10 +72,37 @@ def collect_targets(state: GraphState) -> GraphState:
         else:
             selected_set.add(str(p_obj).replace("\\", "/").lstrip("./"))
 
+    if mode == "diff":
+        base_ref = str(request.get("diff_base_ref") or os.getenv("DIFF_BASE_REF", "")).strip() or None
+        head_ref = str(request.get("diff_head_ref") or os.getenv("DIFF_HEAD_REF", "")).strip() or None
+        commit = str(request.get("diff_commit") or os.getenv("DIFF_COMMIT", "")).strip() or None
+        staged = _parse_bool(request.get("diff_staged"), default=_parse_bool(os.getenv("DIFF_STAGED", "0")))
+        timeout_sec = int(os.getenv("GIT_DIFF_TIMEOUT_SEC", "30"))
+        diff_changed_lines, diff_logs, diff_error = collect_git_diff_changed_lines(
+            repo_path=repo_path,
+            base_ref=base_ref,
+            head_ref=head_ref,
+            commit=commit,
+            staged=staged,
+            timeout_sec=timeout_sec,
+        )
+        state.setdefault("logs", []).extend([f"collect_targets detail: {x}" for x in diff_logs])
+        state.setdefault("logs", []).append(
+            f"collect_targets detail: diff_candidates={len(diff_changed_lines)}"
+        )
+        if diff_error:
+            state.setdefault("errors", []).append(f"collect_targets: {diff_error}")
+            state["targets"] = []
+            return state
+
     targets = []
     languages = set(repo.get("languages", []))
+    if mode == "diff":
+        candidate_paths = ((repo_path / rel).resolve() for rel in sorted(diff_changed_lines.keys()))
+    else:
+        candidate_paths = repo_path.rglob("*")
 
-    for file_path in repo_path.rglob("*"):
+    for file_path in candidate_paths:
         if not file_path.is_file():
             continue
 
@@ -79,6 +117,9 @@ def collect_targets(state: GraphState) -> GraphState:
         abs_norm = str(file_path.resolve()).replace("\\", "/")
         if mode == "selected" and rel_path not in selected_set and abs_norm not in selected_set:
             continue
+        changed_lines = diff_changed_lines.get(rel_path, [])
+        if mode == "diff" and not changed_lines:
+            continue
 
         lang = _EXT_TO_LANG.get(file_path.suffix.lower())
         if not lang or lang not in languages:
@@ -88,7 +129,7 @@ def collect_targets(state: GraphState) -> GraphState:
             {
                 "path": str(file_path.resolve()),
                 "language": lang,
-                "changed_lines": [],
+                "changed_lines": changed_lines,
             }
         )
 

@@ -13,9 +13,15 @@ class ScanRequest(TypedDict, total=False):
     mode: ScanMode
     enable_security_scan: bool
     enable_fix_suggestion: bool
+    enable_llm_triage: bool
     include_globs: list[str]
     exclude_globs: list[str]
     selected_paths: list[str]
+    diff_base_ref: str
+    diff_head_ref: str
+    diff_commit: str
+    diff_staged: bool
+    diff_findings_filter: Literal["mark", "only"]
 
 
 class RepoProfile(TypedDict, total=False):
@@ -56,6 +62,7 @@ class Finding(TypedDict, total=False):
     snippet: str | None
     confidence: str
     autofix_available: bool
+    in_diff: bool
 
 
 class Report(TypedDict, total=False):

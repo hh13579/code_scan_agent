@@ -256,6 +256,25 @@ def llm_triage(state: GraphState) -> GraphState:
         state.setdefault("logs", []).append("llm_triage: no findings")
         return state
 
+    request = state.get("request", {})
+    mode = str(request.get("mode", "full"))
+    req_enable_llm = request.get("enable_llm_triage")
+    if isinstance(req_enable_llm, bool):
+        enable_llm = req_enable_llm
+    elif mode == "diff":
+        enable_llm = _get_int_env("DIFF_ENABLE_LLM", 0, min_value=0) > 0
+    else:
+        enable_llm = True
+
+    if not enable_llm:
+        triaged = _local_triage(findings)
+        state["triaged_findings"] = triaged
+        state.setdefault("logs", []).append(
+            f"llm_triage: disabled (mode={mode}), fallback_local={len(findings)}"
+        )
+        state.setdefault("logs", []).append(f"llm_triage: triaged={len(triaged)}")
+        return state
+
     findings.sort(
         key=lambda x: (
             _SEVERITY_ORDER.get(x.get("severity", "info"), 99),
