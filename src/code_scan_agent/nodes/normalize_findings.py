@@ -250,9 +250,15 @@ def _extract_tool_name(tool_result_tool_field: str, raw: dict[str, Any]) -> str:
 
 def _get_diff_filter_mode(state: GraphState) -> str:
     request = state.get("request", {})
-    raw = request.get("diff_findings_filter") or os.getenv("DIFF_FINDINGS_FILTER", "mark")
+    request_mode = str(request.get("mode", "full")).strip().lower()
+    default_mode = "only" if request_mode == "diff" else "mark"
+
+    raw = request.get("diff_findings_filter")
+    if not raw:
+        raw = os.getenv("DIFF_FINDINGS_FILTER", default_mode)
+
     mode = str(raw).strip().lower()
-    return mode if mode in {"mark", "only"} else "mark"
+    return mode if mode in {"mark", "only"} else default_mode
 
 
 def _build_diff_line_index(state: GraphState, repo_root: Path) -> dict[str, set[int]]:

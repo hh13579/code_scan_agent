@@ -76,10 +76,12 @@ python3 main.py /path/to/repo --mode diff > /tmp/code_scan_diff_report.txt
 ### 5.2 扫两个 ref 之间的改动（PR 场景）
 
 ```bash
-python3 main.py /path/to/repo --mode diff --diff-base-ref origin/main --diff-head-ref HEAD > /tmp/code_scan_diff_report.txt
+python3 main.py /path/to/repo --mode diff --base origin/main --head HEAD > /tmp/code_scan_diff_report.txt
 ```
 
-只传 `--diff-base-ref` 时，默认比较 `base...HEAD`。
+`--base/--head` 是 `--diff-base-ref/--diff-head-ref` 的简写。
+只传 `--diff-base-ref` 或 `--base` 时，默认比较 `base...HEAD`。
+可通过 `--diff-range-mode double` 改为 `base..HEAD`。
 
 ### 5.3 扫某一个 commit 引入的改动
 
@@ -92,12 +94,31 @@ python3 main.py /path/to/repo --mode diff --diff-commit 2492cad > /tmp/code_scan
 ### 5.4 只保留“命中改动行”的 findings
 
 ```bash
-export DIFF_FINDINGS_FILTER=only
-python3 main.py /path/to/repo --mode diff > /tmp/code_scan_diff_report.txt
+python3 main.py /path/to/repo --mode diff --diff-findings-filter only > /tmp/code_scan_diff_report.txt
 ```
 
-默认 `DIFF_FINDINGS_FILTER=mark`：会给 finding 打 `in_diff=true/false`，但不丢弃非改动行。
+`--diff-findings-filter` 可选：
+- `only`: 只保留命中改动行的 finding（推荐，默认）
+- `mark`: 保留全部 finding，并标记 `in_diff=true/false`
+
 默认 `DIFF_ENABLE_LLM=0`：diff 模式下只做本地 triage（更快更稳定）。
+
+### 5.5 Jenkins / CI 推荐命令
+
+```bash
+python3 main.py /path/to/repo \
+  --mode diff \
+  --base origin/main \
+  --head HEAD \
+  --no-llm \
+  --diff-findings-filter only \
+  --out artifacts/report.json \
+  --fail-on high
+```
+
+- `--no-llm`: 关闭 DeepSeek，固定走本地 triage
+- `--out`: 把 JSON 报告写到文件
+- `--fail-on high`: 存在 `high` 或 `critical` finding 时返回 exit code `2`
 
 ## 6. 环境变量
 
@@ -136,8 +157,9 @@ python3 main.py /path/to/repo --mode diff > /tmp/code_scan_diff_report.txt
 - `DIFF_HEAD_REF`: 等价于 `--diff-head-ref`
 - `DIFF_COMMIT`: 等价于 `--diff-commit`
 - `DIFF_STAGED`: `1` 表示只看 staged 变更（当未指定 base/head 时）
+- `DIFF_RANGE_MODE`: `triple` 或 `double`（默认 `triple`）
 - `GIT_DIFF_TIMEOUT_SEC`: git diff 超时（默认 `30`）
-- `DIFF_FINDINGS_FILTER`: `mark` 或 `only`（默认 `mark`）
+- `DIFF_FINDINGS_FILTER`: `mark` 或 `only`（默认 `only`）
 - `DIFF_ENABLE_LLM`: diff 模式是否启用 DeepSeek 分诊（默认 `0`，设置 `1` 开启）
 
 ## 7. 常见问题

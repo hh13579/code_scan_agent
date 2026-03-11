@@ -17,10 +17,13 @@ class ScanRequest(TypedDict, total=False):
     include_globs: list[str]
     exclude_globs: list[str]
     selected_paths: list[str]
+    base_ref: str
+    head_ref: str
     diff_base_ref: str
     diff_head_ref: str
     diff_commit: str
     diff_staged: bool
+    diff_range_mode: Literal["triple", "double"]
     diff_findings_filter: Literal["mark", "only"]
 
 

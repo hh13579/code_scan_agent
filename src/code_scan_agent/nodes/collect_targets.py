@@ -5,7 +5,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 from code_scan_agent.graph.state import GraphState
-from code_scan_agent.tools.repo.git_diff import collect_git_diff_changed_lines
+from code_scan_agent.tools.repo.git_diff import DiffMode, collect_git_diff_changed_lines
 
 
 _EXT_TO_LANG = {
@@ -73,10 +73,12 @@ def collect_targets(state: GraphState) -> GraphState:
             selected_set.add(str(p_obj).replace("\\", "/").lstrip("./"))
 
     if mode == "diff":
-        base_ref = str(request.get("diff_base_ref") or os.getenv("DIFF_BASE_REF", "")).strip() or None
-        head_ref = str(request.get("diff_head_ref") or os.getenv("DIFF_HEAD_REF", "")).strip() or None
+        base_ref = str(request.get("diff_base_ref") or request.get("base_ref") or os.getenv("DIFF_BASE_REF", "")).strip() or None
+        head_ref = str(request.get("diff_head_ref") or request.get("head_ref") or os.getenv("DIFF_HEAD_REF", "")).strip() or None
         commit = str(request.get("diff_commit") or os.getenv("DIFF_COMMIT", "")).strip() or None
         staged = _parse_bool(request.get("diff_staged"), default=_parse_bool(os.getenv("DIFF_STAGED", "0")))
+        range_mode_raw = str(request.get("diff_range_mode") or os.getenv("DIFF_RANGE_MODE", "triple")).strip().lower()
+        range_mode: DiffMode = "double" if range_mode_raw == "double" else "triple"
         timeout_sec = int(os.getenv("GIT_DIFF_TIMEOUT_SEC", "30"))
         diff_changed_lines, diff_logs, diff_error = collect_git_diff_changed_lines(
             repo_path=repo_path,
@@ -84,6 +86,7 @@ def collect_targets(state: GraphState) -> GraphState:
             head_ref=head_ref,
             commit=commit,
             staged=staged,
+            range_mode=range_mode,
             timeout_sec=timeout_sec,
         )
         state.setdefault("logs", []).extend([f"collect_targets detail: {x}" for x in diff_logs])
