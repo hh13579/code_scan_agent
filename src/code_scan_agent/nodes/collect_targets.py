@@ -5,7 +5,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 from code_scan_agent.graph.state import GraphState
-from code_scan_agent.tools.repo.git_diff import DiffMode, collect_git_diff_changed_lines
+from code_scan_agent.tools.repo.git_diff import DiffMode, get_git_diff_files
 
 
 _EXT_TO_LANG = {
@@ -59,6 +59,7 @@ def collect_targets(state: GraphState) -> GraphState:
     exclude_globs = list(request.get("exclude_globs", []))
     selected_paths = list(request.get("selected_paths", []))
     diff_changed_lines: dict[str, list[int]] = {}
+    diff_files_state: list[dict[str, object]] = []
 
     selected_set: set[str] = set()
     for p in selected_paths:
@@ -80,23 +81,58 @@ def collect_targets(state: GraphState) -> GraphState:
         range_mode_raw = str(request.get("diff_range_mode") or os.getenv("DIFF_RANGE_MODE", "triple")).strip().lower()
         range_mode: DiffMode = "double" if range_mode_raw == "double" else "triple"
         timeout_sec = int(os.getenv("GIT_DIFF_TIMEOUT_SEC", "30"))
-        diff_changed_lines, diff_logs, diff_error = collect_git_diff_changed_lines(
-            repo_path=repo_path,
-            base_ref=base_ref,
-            head_ref=head_ref,
-            commit=commit,
-            staged=staged,
-            range_mode=range_mode,
-            timeout_sec=timeout_sec,
-        )
-        state.setdefault("logs", []).extend([f"collect_targets detail: {x}" for x in diff_logs])
-        state.setdefault("logs", []).append(
-            f"collect_targets detail: diff_candidates={len(diff_changed_lines)}"
-        )
-        if diff_error:
-            state.setdefault("errors", []).append(f"collect_targets: {diff_error}")
+        try:
+            raw_diff_files = get_git_diff_files(
+                repo_path=repo_path,
+                base_ref=base_ref,
+                head_ref=head_ref,
+                commit=commit,
+                staged=staged,
+                mode=range_mode,
+                exclude_deleted=True,
+                timeout_sec=timeout_sec,
+            )
+        except Exception as e:  # noqa: BLE001
+            state.setdefault("errors", []).append(f"collect_targets: {e}")
             state["targets"] = []
+            state["diff_files"] = []
             return state
+
+        for item in raw_diff_files:
+            rel_path = str(item.get("path", ""))
+            if not rel_path:
+                continue
+            if any(rel_path.startswith(prefix) for prefix in _DEFAULT_EXCLUDE_PREFIXES):
+                continue
+            if exclude_globs and _match_globs(rel_path, exclude_globs):
+                continue
+            if include_globs and not _match_globs(rel_path, include_globs):
+                continue
+
+            abs_path = (repo_path / rel_path).resolve()
+            lang = _EXT_TO_LANG.get(abs_path.suffix.lower())
+            if not lang:
+                continue
+
+            changed_lines = list(item.get("changed_lines", []))
+            diff_changed_lines[rel_path] = changed_lines
+            diff_files_state.append(
+                {
+                    "path": rel_path,
+                    "old_path": str(item.get("old_path", "")),
+                    "language": lang,
+                    "status": str(item.get("status", "")),
+                    "changed_lines": changed_lines,
+                    "patch": str(item.get("patch", "")),
+                    "hunks": list(item.get("hunks", [])),
+                }
+            )
+
+        total_changed_lines = sum(len(lines) for lines in diff_changed_lines.values())
+        state.setdefault("logs", []).append(
+            "collect_targets detail: "
+            f"diff_candidates={len(raw_diff_files)}, code_diff_files={len(diff_files_state)}, changed_lines={total_changed_lines}"
+        )
 
     targets = []
     languages = set(repo.get("languages", []))
@@ -137,6 +173,8 @@ def collect_targets(state: GraphState) -> GraphState:
         )
 
     state["targets"] = targets
+    if mode == "diff":
+        state["diff_files"] = diff_files_state
     state.setdefault("logs", []).append(
         f"collect_targets: mode={mode}, total_targets={len(targets)}"
     )

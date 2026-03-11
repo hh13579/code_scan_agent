@@ -31,6 +31,8 @@ pipeline {
             '--branch1', params.BRANCH1,
             '--branch2', params.BRANCH2,
             '--out', "${artifactDir}/report.json",
+            '--out-zh', "${artifactDir}/report_zh.md",
+            '--out-sarif', "${artifactDir}/report.sarif",
             '--log-out', "${artifactDir}/run.log",
             '--fail-on', params.FAIL_ON,
           ]

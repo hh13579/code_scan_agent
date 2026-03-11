@@ -14,6 +14,7 @@ class ScanRequest(TypedDict, total=False):
     enable_security_scan: bool
     enable_fix_suggestion: bool
     enable_llm_triage: bool
+    enable_llm_diff_review: bool
     include_globs: list[str]
     exclude_globs: list[str]
     selected_paths: list[str]
@@ -41,6 +42,16 @@ class FileTarget(TypedDict, total=False):
     changed_lines: list[int]
 
 
+class DiffFile(TypedDict, total=False):
+    path: str
+    old_path: str
+    language: Language
+    status: str
+    changed_lines: list[int]
+    patch: str
+    hunks: list[str]
+
+
 class ToolResult(TypedDict, total=False):
     tool: str
     language: str
@@ -55,17 +66,22 @@ class ToolResult(TypedDict, total=False):
 class Finding(TypedDict, total=False):
     language: Language
     tool: str
+    source: str
     rule_id: str
     category: str
     severity: Severity
     file: str
     line: int | None
     column: int | None
+    title: str
     message: str
     snippet: str | None
     confidence: str
     autofix_available: bool
     in_diff: bool
+    evidence: str
+    suggested_action: str
+    overlaps_static: bool
 
 
 class Report(TypedDict, total=False):
@@ -82,10 +98,15 @@ class GraphState(TypedDict, total=False):
     # 中间态
     repo_profile: RepoProfile
     targets: list[FileTarget]
+    diff_files: list[DiffFile]
     selected_toolchains: dict[str, list[str]]
     raw_tool_results: list[ToolResult]
     normalized_findings: list[Finding]
     triaged_findings: list[Finding]
+    llm_review_findings: list[Finding]
+    static_findings: list[Finding]
+    merged_findings: list[Finding]
+    review_context_blocks: list[dict[str, Any]]
 
     # 输出
     report: Report

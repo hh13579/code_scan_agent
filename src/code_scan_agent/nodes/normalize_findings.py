@@ -221,6 +221,7 @@ def _normalize_one_raw(
     finding: Finding = {
         "language": language if language in {"cpp", "java", "ts"} else "cpp",  # 兜底
         "tool": tool,
+        "source": tool,
         "rule_id": rule_id,
         "category": category,
         "severity": severity,

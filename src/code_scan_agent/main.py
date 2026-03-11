@@ -189,6 +189,16 @@ def main() -> int:
         help="Write JSON report to this file",
     )
     parser.add_argument(
+        "--out-zh",
+        default="",
+        help="Write a local Chinese Markdown report to this file",
+    )
+    parser.add_argument(
+        "--out-sarif",
+        default="",
+        help="Write SARIF report to this file",
+    )
+    parser.add_argument(
         "--log-out",
         default="",
         help="Write full scan console output to this file",
@@ -281,8 +291,12 @@ def main() -> int:
         "errors": [],
         "logs": [],
         "raw_tool_results": [],
+        "diff_files": [],
         "normalized_findings": [],
         "triaged_findings": [],
+        "llm_review_findings": [],
+        "static_findings": [],
+        "merged_findings": [],
     }
 
     result = app.invoke(init_state)
@@ -301,6 +315,29 @@ def main() -> int:
 
     else:
         out_path = None
+
+    if args.out_zh:
+        from code_scan_agent.reporters.markdown_reporter_zh import render_markdown_report_zh
+
+        out_zh_path = Path(args.out_zh).expanduser().resolve()
+        try:
+            _write_report(out_zh_path, render_markdown_report_zh(report if isinstance(report, dict) else {}))
+        except OSError as e:
+            print(f"\nFailed to write Chinese markdown report: {out_zh_path}: {e}")
+            return 1
+
+    if args.out_sarif:
+        from code_scan_agent.reporters.sarif_reporter import render_sarif_report
+
+        out_sarif_path = Path(args.out_sarif).expanduser().resolve()
+        try:
+            _write_report(
+                out_sarif_path,
+                json.dumps(render_sarif_report(report if isinstance(report, dict) else {}), ensure_ascii=False, indent=2),
+            )
+        except OSError as e:
+            print(f"\nFailed to write SARIF report: {out_sarif_path}: {e}")
+            return 1
 
     run_output_text = _render_run_output(
         report_text=report_text,

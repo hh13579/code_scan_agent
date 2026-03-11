@@ -283,12 +283,19 @@ def llm_triage(state: GraphState) -> GraphState:
     request = state.get("request", {})
     mode = str(request.get("mode", "full"))
     req_enable_llm = request.get("enable_llm_triage")
+    explicit_no_llm = isinstance(req_enable_llm, bool) and not req_enable_llm
     if isinstance(req_enable_llm, bool):
         enable_llm = req_enable_llm
     elif mode == "diff":
         enable_llm = _get_int_env("DIFF_ENABLE_LLM", 0, min_value=0) > 0
     else:
         enable_llm = True
+
+    if explicit_no_llm:
+        state["triaged_findings"] = [dict(item) for item in findings]
+        state.setdefault("logs", []).append("llm_triage: skipped (--no-llm)")
+        state.setdefault("logs", []).append(f"llm_triage: triaged={len(findings)}")
+        return state
 
     if not enable_llm:
         triaged = _local_triage(findings)
