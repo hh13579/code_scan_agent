@@ -3,11 +3,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import ssl
 import time
 from typing import Any
 from urllib import error, request
 
 from code_scan_agent.graph.state import GraphState
+
+try:
+    import certifi
+except Exception:  # noqa: BLE001
+    certifi = None
 
 
 _SEVERITY_ORDER = {
@@ -75,6 +81,24 @@ def _build_api_url() -> str:
     if base_url.endswith("/v1"):
         return f"{base_url}/chat/completions"
     return f"{base_url}/v1/chat/completions"
+
+
+def _build_ssl_context() -> ssl.SSLContext | None:
+    insecure = os.getenv("DEEPSEEK_INSECURE_SKIP_VERIFY", "").strip().lower()
+    if insecure in {"1", "true", "yes", "on"}:
+        return ssl._create_unverified_context()
+    cafile = os.getenv("SSL_CERT_FILE", "").strip()
+    if not cafile and certifi is not None:
+        try:
+            cafile = certifi.where()
+        except Exception:  # noqa: BLE001
+            cafile = ""
+    if not cafile:
+        return None
+    try:
+        return ssl.create_default_context(cafile=cafile)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -158,7 +182,7 @@ def _call_deepseek(findings: list[dict[str, Any]]) -> dict[str, Any]:
     )
 
     try:
-        with request.urlopen(req, timeout=timeout_sec) as resp:
+        with request.urlopen(req, timeout=timeout_sec, context=_build_ssl_context()) as resp:
             body = resp.read().decode("utf-8", errors="replace")
     except error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")

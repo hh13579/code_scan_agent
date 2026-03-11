@@ -80,8 +80,15 @@ python3 main.py /path/to/repo --mode diff --base origin/main --head HEAD > /tmp/
 ```
 
 `--base/--head` 是 `--diff-base-ref/--diff-head-ref` 的简写。
+`--branch1/--branch2` 也是同一组参数的别名，便于按“分支1/分支2/项目路径”传入。
 只传 `--diff-base-ref` 或 `--base` 时，默认比较 `base...HEAD`。
 可通过 `--diff-range-mode double` 改为 `base..HEAD`。
+
+如果传了 `--base/--head` 或 `--branch1/--branch2`，即使不显式写 `--mode diff`，目录目标也会自动按 diff 模式执行。
+
+```bash
+python3 main.py /abs/project/path --branch1 origin/main --branch2 feature/test
+```
 
 ### 5.3 扫某一个 commit 引入的改动
 
@@ -119,6 +126,58 @@ python3 main.py /path/to/repo \
 - `--no-llm`: 关闭 DeepSeek，固定走本地 triage
 - `--out`: 把 JSON 报告写到文件
 - `--fail-on high`: 存在 `high` 或 `critical` finding 时返回 exit code `2`
+
+### 5.6 扫描后二阶段自动生成中文报告
+
+```bash
+python3 main.py /path/to/repo \
+  --branch1 origin/main \
+  --branch2 feature/test \
+  --no-llm \
+  --out artifacts/report.json \
+  --log-out artifacts/run.log \
+  --cn-report-out artifacts/report_cn.md \
+  --cn-report-json-out artifacts/report_cn.json \
+  --cn-report-local-fallback
+```
+
+- `--log-out`: 把完整扫描输出落盘，供二阶段中文报告复用
+- `--cn-report-out`: 输出中文 Markdown 报告
+- `--cn-report-json-out`: 输出中文报告对应的结构化 JSON
+- `--cn-report-local-fallback`: DeepSeek 不可用时退化为本地中文报告；若不加该参数，则 DeepSeek 失败会让命令直接返回非 0
+
+如果你已经有历史的 `report.json` 和 `run.log`，也可以单独执行：
+
+```bash
+python3 scripts/deepseek_cn_report.py \
+  --report /tmp/code_scan_report.json \
+  --log /tmp/code_scan_run.log \
+  --repo /abs/project/path \
+  --base origin/main \
+  --head feature/test \
+  --out /tmp/code_scan_cn.md \
+  --raw-out /tmp/code_scan_cn.json \
+  --allow-local-fallback
+```
+
+### 5.7 Jenkinsfile
+
+仓库根目录提供了 [Jenkinsfile](/Users/didi/work/sdk-env/code_scan_agent/Jenkinsfile)，默认参数就是：
+
+- `REPO_PATH`: 目标项目绝对路径
+- `BRANCH1`: 基线分支
+- `BRANCH2`: 目标分支
+- `FAIL_ON`: 命中阈值
+- `ENABLE_CN_REPORT`: 是否自动生成中文报告
+- `CN_REPORT_LOCAL_FALLBACK`: DeepSeek 不可用时是否允许本地 fallback
+
+Pipeline 会归档这些产物：
+
+- `artifacts/report.json`
+- `artifacts/run.log`
+- `artifacts/report_cn.md`
+- `artifacts/report_cn.json`
+- `artifacts/scan_exit_code.txt`
 
 ## 6. 环境变量
 
