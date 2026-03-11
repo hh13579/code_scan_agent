@@ -11,8 +11,20 @@ from code_scan_agent.prompts.diff_review_prompt import build_diff_review_message
 from code_scan_agent.tools.deepseek_cn_report import _call_deepseek_with_retry
 
 
-_VALID_SEVERITY = {"critical", "high", "medium", "low", "info"}
-_VALID_CONFIDENCE = {"high", "medium", "low"}
+_ALLOWED_SEVERITIES = {"high", "medium", "low"}
+_ALLOWED_REVIEW_ACTIONS = {"block", "should_fix", "follow_up"}
+_ALLOWED_CONFIDENCE = {"low", "medium", "high"}
+_ALLOWED_CATEGORIES = {
+    "logic_regression",
+    "boundary_condition",
+    "contract_mismatch",
+    "exception_handling",
+    "state_consistency",
+    "concurrency",
+    "config_behavior_change",
+    "partial_refactor",
+    "other",
+}
 
 
 def _append_error(state: GraphState, message: str) -> None:
@@ -76,24 +88,18 @@ def _select_diff_blocks(
     max_files: int,
     max_hunks: int,
     max_patch_chars: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    changed_files: list[dict[str, Any]] = []
+) -> tuple[list[str], list[dict[str, Any]]]:
+    changed_files: list[str] = []
     diff_blocks: list[dict[str, Any]] = []
     hunk_budget = max_hunks
 
     for item in diff_files[:max_files]:
+        file_path = str(item.get("path", ""))
+        if not file_path:
+            continue
         changed_lines = list(item.get("changed_lines", []))
         hunks = [str(hunk) for hunk in item.get("hunks", []) if str(hunk).strip()]
-        changed_files.append(
-            {
-                "path": str(item.get("path", "")),
-                "old_path": str(item.get("old_path", "")),
-                "status": str(item.get("status", "")),
-                "language": str(item.get("language", "")),
-                "changed_line_count": len(changed_lines),
-                "hunk_count": len(hunks),
-            }
-        )
+        changed_files.append(file_path)
 
         if hunks:
             for index, hunk in enumerate(hunks, start=1):
@@ -101,10 +107,10 @@ def _select_diff_blocks(
                     break
                 diff_blocks.append(
                     {
-                        "path": str(item.get("path", "")),
+                        "file": file_path,
                         "status": str(item.get("status", "")),
                         "language": str(item.get("language", "")),
-                        "block_id": f"{item.get('path', '')}#{index}",
+                        "block_id": f"{file_path}#{index}",
                         "changed_lines": changed_lines,
                         "patch": _truncate_text(hunk, max_patch_chars),
                     }
@@ -115,10 +121,10 @@ def _select_diff_blocks(
                 break
             diff_blocks.append(
                 {
-                    "path": str(item.get("path", "")),
+                    "file": file_path,
                     "status": str(item.get("status", "")),
                     "language": str(item.get("language", "")),
-                    "block_id": f"{item.get('path', '')}#patch",
+                    "block_id": f"{file_path}#patch",
                     "changed_lines": changed_lines,
                     "patch": _truncate_text(str(item.get("patch", "")), max_patch_chars),
                 }
@@ -163,33 +169,159 @@ def _call_llm_diff_review(messages: list[dict[str, str]], state: GraphState) -> 
     return json.dumps(result, ensure_ascii=False)
 
 
-def _normalize_line(value: object) -> int | None:
+def _norm_str(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _norm_line(value: Any) -> int | None:
     try:
-        line = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+        if value is None or value == "":
+            return None
+        line = int(value)
+        return line if line > 0 else None
+    except Exception:
         return None
-    return line if line > 0 else None
 
 
-def _normalize_review_findings(parsed: dict[str, Any], repo_root: Path) -> list[Finding]:
+def _infer_language_from_file(path: str) -> str:
+    suffix = Path(path).suffix.lower()
+    if suffix in {".cpp", ".cc", ".cxx", ".hpp", ".h"}:
+        return "cpp"
+    if suffix == ".java":
+        return "java"
+    if suffix in {".ts", ".tsx"}:
+        return "ts"
+    return ""
+
+
+def _norm_severity(value: Any) -> str:
+    severity = _norm_str(value).lower()
+    if severity in _ALLOWED_SEVERITIES:
+        return severity
+    return "low"
+
+
+def _norm_review_action(value: Any, severity: str) -> str:
+    action = _norm_str(value).lower()
+    if action in _ALLOWED_REVIEW_ACTIONS:
+        return action
+    if severity == "high":
+        return "should_fix"
+    return "follow_up"
+
+
+def _norm_confidence(value: Any, severity: str) -> str:
+    confidence = _norm_str(value).lower()
+    if confidence in _ALLOWED_CONFIDENCE:
+        return confidence
+    if severity == "high":
+        return "medium"
+    return "low"
+
+
+def _norm_category(value: Any) -> str:
+    category = _norm_str(value)
+    if category in _ALLOWED_CATEGORIES:
+        return category
+    return "other"
+
+
+def _default_title(message: str, category: str) -> str:
+    if message:
+        short = message.replace("\n", " ").strip()
+        return short[:60] + ("..." if len(short) > 60 else "")
+    if category and category != "other":
+        return category.replace("_", " ")
+    return "Potential semantic issue"
+
+
+def _normalize_evidence(value: Any) -> list[str]:
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            text = _norm_str(item)
+            if text:
+                out.append(text)
+        return out[:5]
+    text = _norm_str(value)
+    return [text] if text else []
+
+
+def _normalize_llm_review_finding(raw: dict[str, Any]) -> Finding:
+    file_path = _norm_str(raw.get("file"))
+    line = _norm_line(raw.get("line"))
+
+    severity = _norm_severity(raw.get("severity"))
+    review_action = _norm_review_action(raw.get("review_action"), severity)
+    confidence = _norm_confidence(raw.get("confidence"), severity)
+    category = _norm_category(raw.get("category"))
+
+    message = _norm_str(raw.get("message"))
+    impact = _norm_str(raw.get("impact"))
+    title = _norm_str(raw.get("title")) or _default_title(message, category)
+    suggested_action = _norm_str(raw.get("suggested_action"))
+    evidence = _normalize_evidence(raw.get("evidence"))
+    language = _norm_str(raw.get("language")) or _infer_language_from_file(file_path)
+
+    if not evidence and confidence == "high":
+        confidence = "medium"
+    elif not evidence and confidence == "medium":
+        confidence = "low"
+
+    if not impact:
+        if severity == "high":
+            impact = "该改动可能引入行为回归或稳定性风险，建议结合具体调用路径进一步确认。"
+        elif severity == "medium":
+            impact = "该改动可能影响局部行为正确性，建议在相关路径上补充验证。"
+        else:
+            impact = "该改动存在一定语义风险，但当前证据不足以判断为明确错误。"
+
+    if not message:
+        message = title or impact
+
+    return {
+        "language": language,  # type: ignore[typeddict-item]
+        "tool": "llm_diff_review",
+        "source": "llm_diff_review",
+        "rule_id": "semantic-review",
+        "category": category,
+        "severity": severity,  # type: ignore[typeddict-item]
+        "file": file_path,
+        "line": line,
+        "column": None,
+        "title": title,
+        "message": message,
+        "impact": impact,
+        "snippet": None,
+        "confidence": confidence,
+        "review_action": review_action,  # type: ignore[typeddict-item]
+        "autofix_available": False,
+        "in_diff": True,
+        "evidence": evidence,
+        "suggested_action": suggested_action,
+    }
+
+
+def _normalize_review_findings(
+    parsed: dict[str, Any],
+    repo_root: Path,
+    diff_paths: set[str],
+) -> tuple[list[Finding], int]:
     findings_raw = parsed.get("findings", [])
     if not isinstance(findings_raw, list):
-        return []
+        return [], 0
 
     findings: list[Finding] = []
+    dropped = 0
     for item in findings_raw:
         if not isinstance(item, dict):
+            dropped += 1
             continue
 
-        severity = str(item.get("severity", "medium")).strip().lower()
-        if severity not in _VALID_SEVERITY:
-            severity = "medium"
-
-        confidence = str(item.get("confidence", "medium")).strip().lower()
-        if confidence not in _VALID_CONFIDENCE:
-            confidence = "medium"
-
-        file_path = str(item.get("file", "")).replace("\\", "/").lstrip("./")
+        normalized = _normalize_llm_review_finding(item)
+        file_path = str(normalized.get("file", "")).replace("\\", "/").lstrip("./")
         if file_path:
             try:
                 absolute = Path(file_path)
@@ -197,32 +329,12 @@ def _normalize_review_findings(parsed: dict[str, Any], repo_root: Path) -> list[
                     file_path = str(absolute.resolve().relative_to(repo_root.resolve())).replace("\\", "/")
             except Exception:
                 file_path = file_path.replace("\\", "/")
-
-        title = str(item.get("title", "")).strip()
-        message = str(item.get("message", "")).strip() or title
-        if not message:
+        if not file_path or file_path not in diff_paths:
+            dropped += 1
             continue
-
-        finding: Finding = {
-            "tool": "llm_diff_review",
-            "source": "llm_diff_review",
-            "rule_id": "semantic-review",
-            "category": str(item.get("category", "semantic-review")).strip() or "semantic-review",
-            "severity": severity,  # type: ignore[typeddict-item]
-            "file": file_path,
-            "line": _normalize_line(item.get("line")),
-            "column": None,
-            "title": title or "LLM diff review finding",
-            "message": message,
-            "snippet": None,
-            "confidence": confidence,
-            "autofix_available": False,
-            "in_diff": True,
-            "evidence": str(item.get("evidence", "")).strip(),
-            "suggested_action": str(item.get("suggested_action", "")).strip(),
-        }
-        findings.append(finding)
-    return findings
+        normalized["file"] = file_path
+        findings.append(normalized)
+    return findings, dropped
 
 
 def review_diff_with_llm(state: GraphState) -> GraphState:
@@ -306,9 +418,10 @@ def review_diff_with_llm(state: GraphState) -> GraphState:
         _append_error(state, "review_diff_with_llm: response JSON parse failed")
         return state
 
-    findings = _normalize_review_findings(parsed, repo_root)
+    findings, dropped = _normalize_review_findings(parsed, repo_root, diff_paths)
     state["llm_review_findings"] = findings
     state.setdefault("logs", []).append(
-        f"review_diff_with_llm: reviewed_files={len(changed_files)}, diff_blocks={len(diff_blocks)}, findings={len(findings)}"
+        "review_diff_with_llm: "
+        f"reviewed_files={len(changed_files)}, diff_blocks={len(diff_blocks)}, findings={len(findings)}, dropped={dropped}"
     )
     return state

@@ -39,6 +39,13 @@ def render_sarif_report(report: dict[str, Any]) -> dict[str, Any]:
     for item in findings:
         file_path = str(item.get("file", "") or "")
         line = item.get("line")
+        evidence = item.get("evidence", [])
+        if isinstance(evidence, str):
+            evidence_text = evidence
+        elif isinstance(evidence, list):
+            evidence_text = " | ".join(str(part) for part in evidence if str(part).strip())
+        else:
+            evidence_text = ""
         location: dict[str, Any] | None = None
         if file_path:
             location = {
@@ -58,6 +65,9 @@ def render_sarif_report(report: dict[str, Any]) -> dict[str, Any]:
                 "source": str(item.get("source", "") or item.get("tool", "") or "unknown"),
                 "category": str(item.get("category", "") or ""),
                 "confidence": str(item.get("confidence", "") or ""),
+                "review_action": str(item.get("review_action", "") or ""),
+                "impact": str(item.get("impact", "") or ""),
+                "evidence": evidence_text,
                 "suggested_action": str(item.get("suggested_action", "") or ""),
                 "overlaps_static": bool(item.get("overlaps_static", False)),
             },

@@ -3,84 +3,233 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from code_scan_agent.graph.state import Finding, GraphState
+from code_scan_agent.graph.state import GraphState
 
 
-def _group_findings(findings: list[Finding]) -> tuple[dict[str, list[Finding]], dict[str, list[Finding]]]:
-    grouped_by_file: dict[str, list[Finding]] = defaultdict(list)
-    grouped_by_severity: dict[str, list[Finding]] = defaultdict(list)
+_SEVERITIES = ("critical", "high", "medium", "low", "info")
+_SEV_ORDER = {
+    "critical": 0,
+    "high": 1,
+    "medium": 2,
+    "low": 3,
+    "info": 4,
+}
+_REVIEW_ACTION_ORDER = {
+    "block": 0,
+    "should_fix": 1,
+    "follow_up": 2,
+    "": 3,
+}
 
-    for finding in findings:
-        grouped_by_file[str(finding.get("file", ""))].append(finding)
-        grouped_by_severity[str(finding.get("severity", "info"))].append(finding)
 
-    return dict(grouped_by_file), dict(grouped_by_severity)
+def _safe_findings(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [x for x in value if isinstance(x, dict)]
 
 
-def _build_summary(grouped_by_severity: dict[str, list[Finding]]) -> dict[str, int]:
+def _severity_of(f: dict[str, Any]) -> str:
+    sev = str(f.get("severity", "info")).lower()
+    if sev not in _SEVERITIES:
+        return "info"
+    return sev
+
+
+def _group_by_file(findings: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped = defaultdict(list)
+    for f in findings:
+        grouped[str(f.get("file", ""))].append(f)
+    return dict(grouped)
+
+
+def _group_by_severity(findings: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped = defaultdict(list)
+    for f in findings:
+        grouped[_severity_of(f)].append(f)
+    return {sev: grouped.get(sev, []) for sev in _SEVERITIES}
+
+
+def _build_summary(findings: list[dict[str, Any]]) -> dict[str, int]:
+    grouped = _group_by_severity(findings)
     return {
-        "total": sum(len(items) for items in grouped_by_severity.values()),
-        "critical": len(grouped_by_severity.get("critical", [])),
-        "high": len(grouped_by_severity.get("high", [])),
-        "medium": len(grouped_by_severity.get("medium", [])),
-        "low": len(grouped_by_severity.get("low", [])),
-        "info": len(grouped_by_severity.get("info", [])),
+        "total": len(findings),
+        "critical": len(grouped["critical"]),
+        "high": len(grouped["high"]),
+        "medium": len(grouped["medium"]),
+        "low": len(grouped["low"]),
+        "info": len(grouped["info"]),
     }
 
 
-def _coerce_findings(raw: Any) -> list[Finding]:
-    return list(raw) if isinstance(raw, list) else []
+def _line_of(f: dict[str, Any]) -> int:
+    try:
+        line = f.get("line")
+        if line is None:
+            return 10**9
+        return int(line)
+    except Exception:
+        return 10**9
 
 
-def _select_primary_findings(state: GraphState) -> list[Finding]:
-    merged = _coerce_findings(state.get("merged_findings"))
-    if merged:
-        return merged
-    triaged = _coerce_findings(state.get("triaged_findings"))
-    if triaged:
-        return triaged
-    return _coerce_findings(state.get("normalized_findings"))
+def _is_llm_review_finding(f: dict[str, Any]) -> bool:
+    source = str(f.get("source", "")).strip().lower()
+    tool = str(f.get("tool", "")).strip().lower()
+    return source == "llm_diff_review" or tool == "llm_diff_review"
+
+
+def _has_impact(f: dict[str, Any]) -> bool:
+    return bool(str(f.get("impact", "")).strip())
+
+
+def _has_evidence(f: dict[str, Any]) -> bool:
+    evidence = f.get("evidence", [])
+    if isinstance(evidence, list):
+        return any(str(item).strip() for item in evidence)
+    if isinstance(evidence, str):
+        return bool(evidence.strip())
+    return False
+
+
+def _top_issue_sort_key(f: dict[str, Any]):
+    """
+    top_issues 的排序逻辑（从最值得关注到较次要）：
+    1. review_action: block > should_fix > follow_up
+    2. severity: critical > high > medium > low > info
+    3. LLM semantic finding 稍微优先（因为通常是“静态扫描补充”的高价值风险）
+    4. 有 impact 的优先
+    5. 有 evidence 的优先
+    6. file / line 稳定排序
+    """
+    review_action = str(f.get("review_action", "")).strip().lower()
+    severity = _severity_of(f)
+
+    return (
+        _REVIEW_ACTION_ORDER.get(review_action, 99),
+        _SEV_ORDER.get(severity, 99),
+        0 if _is_llm_review_finding(f) else 1,
+        0 if _has_impact(f) else 1,
+        0 if _has_evidence(f) else 1,
+        str(f.get("file", "")),
+        _line_of(f),
+    )
+
+
+def _build_top_issues(findings: list[dict[str, Any]], max_items: int = 5) -> list[dict[str, Any]]:
+    """
+    选出最值得报告首页展示的问题。
+    规则：
+    - 优先 block / high-risk
+    - 去掉明显过于弱的信息类项
+    - 尽量避免同一 file+line 重复过多
+    """
+    if not findings:
+        return []
+
+    sorted_findings = sorted(findings, key=_top_issue_sort_key)
+
+    picked: list[dict[str, Any]] = []
+    seen_locs: set[tuple[str, int]] = set()
+
+    for f in sorted_findings:
+        severity = _severity_of(f)
+        review_action = str(f.get("review_action", "")).strip().lower()
+
+        # 极弱信息项不进 top_issues
+        if severity == "info" and review_action not in {"block", "should_fix"}:
+            continue
+
+        loc_key = (str(f.get("file", "")), _line_of(f))
+        # 避免同一 file+line 塞太多相似问题
+        if loc_key in seen_locs and review_action != "block":
+            continue
+
+        picked.append(f)
+        seen_locs.add(loc_key)
+
+        if len(picked) >= max_items:
+            break
+
+    return picked
 
 
 def build_report(state: GraphState) -> GraphState:
-    static_findings = _coerce_findings(
-        state.get("static_findings") or state.get("triaged_findings") or state.get("normalized_findings")
+    """
+    优先级：
+    1. merged_findings
+    2. triaged_findings
+    3. normalized_findings
+
+    额外输出：
+    - static_summary
+    - llm_review_summary
+    - merged_summary
+    - top_issues
+    """
+    static_findings = _safe_findings(
+        state.get("static_findings")
+        or state.get("triaged_findings")
+        or state.get("normalized_findings")
+        or []
     )
-    llm_review_findings = _coerce_findings(state.get("llm_review_findings"))
-    merged_findings = _coerce_findings(state.get("merged_findings") or static_findings)
-    primary_findings = _select_primary_findings(state)
+    llm_review_findings = _safe_findings(state.get("llm_review_findings") or [])
+    merged_findings = _safe_findings(
+        state.get("merged_findings")
+        or state.get("triaged_findings")
+        or state.get("normalized_findings")
+        or []
+    )
 
-    grouped_by_file, grouped_by_severity = _group_findings(primary_findings)
-    static_grouped_by_file, static_grouped_by_severity = _group_findings(static_findings)
-    llm_grouped_by_file, llm_grouped_by_severity = _group_findings(llm_review_findings)
-    merged_grouped_by_file, merged_grouped_by_severity = _group_findings(merged_findings)
+    grouped_by_file = _group_by_file(merged_findings)
+    grouped_by_severity = _group_by_severity(merged_findings)
 
-    summary = _build_summary(grouped_by_severity)
-    static_summary = _build_summary(static_grouped_by_severity)
-    llm_review_summary = _build_summary(llm_grouped_by_severity)
-    merged_summary = _build_summary(merged_grouped_by_severity)
+    static_grouped_by_file = _group_by_file(static_findings)
+    static_grouped_by_severity = _group_by_severity(static_findings)
 
-    state["report"] = {
-        "summary": summary,
-        "findings": primary_findings,
+    llm_grouped_by_file = _group_by_file(llm_review_findings)
+    llm_grouped_by_severity = _group_by_severity(llm_review_findings)
+    merged_grouped_by_file = _group_by_file(merged_findings)
+    merged_grouped_by_severity = _group_by_severity(merged_findings)
+
+    merged_summary = _build_summary(merged_findings)
+    static_summary = _build_summary(static_findings)
+    llm_review_summary = _build_summary(llm_review_findings)
+
+    top_issues = _build_top_issues(merged_findings, max_items=5)
+
+    report = {
+        # 默认主视图 = merged
+        "summary": merged_summary,
+        "findings": merged_findings,
         "grouped_by_file": grouped_by_file,
         "grouped_by_severity": grouped_by_severity,
+
+        # 新增：首页摘要可直接消费
+        "top_issues": top_issues,
+
+        # 分来源统计
         "static_summary": static_summary,
         "llm_review_summary": llm_review_summary,
         "merged_summary": merged_summary,
+
         "static_findings": static_findings,
         "llm_review_findings": llm_review_findings,
         "merged_findings": merged_findings,
+
         "static_grouped_by_file": static_grouped_by_file,
         "static_grouped_by_severity": static_grouped_by_severity,
+
         "llm_review_grouped_by_file": llm_grouped_by_file,
         "llm_review_grouped_by_severity": llm_grouped_by_severity,
         "merged_grouped_by_file": merged_grouped_by_file,
         "merged_grouped_by_severity": merged_grouped_by_severity,
     }
 
+    state["report"] = report
     state.setdefault("logs", []).append(
         "build_report: "
-        f"summary={summary}, static={static_summary}, llm_review={llm_review_summary}, merged={merged_summary}"
+        f"static={static_summary['total']}, "
+        f"llm_review={llm_review_summary['total']}, "
+        f"merged={merged_summary['total']}, "
+        f"top_issues={len(top_issues)}"
     )
     return state

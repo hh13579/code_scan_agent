@@ -6,6 +6,7 @@ from typing import Any, Literal, TypedDict
 Language = Literal["cpp", "java", "ts"]
 ScanMode = Literal["full", "diff", "selected"]
 Severity = Literal["critical", "high", "medium", "low", "info"]
+ReviewAction = Literal["block", "should_fix", "follow_up"]
 
 
 class ScanRequest(TypedDict, total=False):
@@ -75,11 +76,13 @@ class Finding(TypedDict, total=False):
     column: int | None
     title: str
     message: str
+    impact: str
     snippet: str | None
     confidence: str
+    review_action: ReviewAction
     autofix_available: bool
     in_diff: bool
-    evidence: str
+    evidence: list[str] | str
     suggested_action: str
     overlaps_static: bool
 

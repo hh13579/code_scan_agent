@@ -65,11 +65,13 @@ class ReviewDiffWithLlmTest(unittest.TestCase):
                         "file": "src/demo.cpp",
                         "line": 2,
                         "severity": "high",
+                        "review_action": "block",
                         "category": "memory",
                         "title": "Potential lifetime issue",
                         "message": "Returned reference may outlive local storage.",
+                        "impact": "The caller may observe undefined behavior if it uses invalid storage.",
                         "confidence": "high",
-                        "evidence": "New code introduces a local temporary.",
+                        "evidence": ["New code introduces a local temporary."],
                         "suggested_action": "Return by value or store data in owned storage.",
                     }
                 ],
@@ -86,6 +88,11 @@ class ReviewDiffWithLlmTest(unittest.TestCase):
         self.assertEqual(findings[0]["severity"], "high")
         self.assertEqual(findings[0]["file"], "src/demo.cpp")
         self.assertEqual(findings[0]["rule_id"], "semantic-review")
+        self.assertEqual(findings[0]["language"], "cpp")
+        self.assertEqual(findings[0]["category"], "other")
+        self.assertEqual(findings[0]["review_action"], "block")
+        self.assertEqual(findings[0]["impact"], "The caller may observe undefined behavior if it uses invalid storage.")
+        self.assertEqual(findings[0]["evidence"], ["New code introduces a local temporary."])
 
     @patch("code_scan_agent.nodes.review_diff_with_llm._call_llm_diff_review")
     def test_dirty_json_falls_back_to_empty_findings(self, mock_call) -> None:
@@ -96,6 +103,39 @@ class ReviewDiffWithLlmTest(unittest.TestCase):
 
         self.assertEqual(result["llm_review_findings"], [])
         self.assertTrue(any("parse failed" in item.lower() for item in result["errors"]))
+
+    @patch("code_scan_agent.nodes.review_diff_with_llm._call_llm_diff_review")
+    def test_finding_without_evidence_or_impact_is_degraded(self, mock_call) -> None:
+        mock_call.return_value = json.dumps(
+            {
+                "summary": {"overall_risk": "low"},
+                "findings": [
+                    {
+                        "file": "src/demo.cpp",
+                        "line": 2,
+                        "severity": "medium",
+                        "review_action": "follow_up",
+                        "category": "logic_regression",
+                        "title": "Suspicious change",
+                        "message": "This may be risky.",
+                        "confidence": "high",
+                        "evidence": [],
+                        "suggested_action": "Inspect the call sites.",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+        state = _base_state(self.repo_path)
+
+        result = review_diff_with_llm(state)  # type: ignore[arg-type]
+
+        self.assertEqual(len(result["llm_review_findings"]), 1)
+        finding = result["llm_review_findings"][0]
+        self.assertEqual(finding["confidence"], "medium")
+        self.assertEqual(finding["impact"], "该改动可能影响局部行为正确性，建议在相关路径上补充验证。")
+        self.assertEqual(finding["evidence"], [])
+        self.assertTrue(any("dropped=0" in item for item in result["logs"]))
 
     def test_missing_diff_files_skips_review(self) -> None:
         state = _base_state(self.repo_path)

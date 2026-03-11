@@ -57,6 +57,9 @@ class BuildReportMergedTest(unittest.TestCase):
         self.assertEqual(report["llm_review_summary"]["total"], 1)
         self.assertEqual(report["merged_summary"]["total"], 2)
         self.assertEqual(report["findings"], result["merged_findings"])
+        self.assertIn("merged_grouped_by_file", report)
+        self.assertIn("merged_grouped_by_severity", report)
+        self.assertIn("top_issues", report)
 
     def test_build_report_stays_compatible_without_merged_findings(self) -> None:
         state = {
@@ -79,6 +82,7 @@ class BuildReportMergedTest(unittest.TestCase):
         self.assertEqual(report["summary"]["total"], 1)
         self.assertEqual(report["findings"], state["triaged_findings"])
         self.assertEqual(report["merged_summary"]["total"], 1)
+        self.assertIn("merged_grouped_by_file", report)
 
 
 if __name__ == "__main__":
