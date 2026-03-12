@@ -33,7 +33,6 @@ def merge_review_findings(state: GraphState) -> GraphState:
     static_findings = list(state.get("triaged_findings") or state.get("normalized_findings") or [])
     llm_review_findings = [dict(item) for item in state.get("llm_review_findings", [])]
 
-    merged_findings = list(static_findings)
     overlap_count = 0
 
     for item in llm_review_findings:
@@ -41,7 +40,8 @@ def merge_review_findings(state: GraphState) -> GraphState:
         if overlaps_static:
             overlap_count += 1
             item["overlaps_static"] = True
-        merged_findings.append(item)
+
+    merged_findings = list(llm_review_findings)
 
     state["static_findings"] = static_findings
     state["llm_review_findings"] = llm_review_findings
@@ -49,6 +49,6 @@ def merge_review_findings(state: GraphState) -> GraphState:
     state.setdefault("logs", []).append(
         "merge_review_findings: "
         f"static={len(static_findings)}, llm_review={len(llm_review_findings)}, "
-        f"merged={len(merged_findings)}, overlaps={overlap_count}"
+        f"reportable={len(merged_findings)}, overlaps={overlap_count}"
     )
     return state

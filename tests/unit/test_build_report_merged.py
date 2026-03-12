@@ -6,7 +6,7 @@ from code_scan_agent.nodes.build_report import build_report
 
 
 class BuildReportMergedTest(unittest.TestCase):
-    def test_build_report_prefers_merged_findings_and_keeps_split_summaries(self) -> None:
+    def test_build_report_prefers_llm_report_view_and_keeps_split_summaries(self) -> None:
         state = {
             "static_findings": [
                 {
@@ -31,14 +31,6 @@ class BuildReportMergedTest(unittest.TestCase):
             "merged_findings": [
                 {
                     "file": "src/demo.cpp",
-                    "line": 10,
-                    "severity": "high",
-                    "category": "memory",
-                    "tool": "cppcheck",
-                    "message": "Static finding",
-                },
-                {
-                    "file": "src/demo.cpp",
                     "line": 12,
                     "severity": "medium",
                     "category": "semantic-review",
@@ -52,10 +44,10 @@ class BuildReportMergedTest(unittest.TestCase):
         result = build_report(state)  # type: ignore[arg-type]
         report = result["report"]
 
-        self.assertEqual(report["summary"]["total"], 2)
+        self.assertEqual(report["summary"]["total"], 1)
         self.assertEqual(report["static_summary"]["total"], 1)
         self.assertEqual(report["llm_review_summary"]["total"], 1)
-        self.assertEqual(report["merged_summary"]["total"], 2)
+        self.assertEqual(report["merged_summary"]["total"], 1)
         self.assertEqual(report["findings"], result["merged_findings"])
         self.assertIn("merged_grouped_by_file", report)
         self.assertIn("merged_grouped_by_severity", report)
@@ -83,6 +75,31 @@ class BuildReportMergedTest(unittest.TestCase):
         self.assertEqual(report["findings"], state["triaged_findings"])
         self.assertEqual(report["merged_summary"]["total"], 1)
         self.assertIn("merged_grouped_by_file", report)
+
+    def test_build_report_hides_static_only_findings_when_merge_stage_ran(self) -> None:
+        state = {
+            "static_findings": [
+                {
+                    "file": "src/demo.cpp",
+                    "line": 10,
+                    "severity": "high",
+                    "category": "memory",
+                    "tool": "cppcheck",
+                    "message": "Static finding",
+                }
+            ],
+            "llm_review_findings": [],
+            "merged_findings": [],
+            "logs": [],
+        }
+
+        result = build_report(state)  # type: ignore[arg-type]
+        report = result["report"]
+
+        self.assertEqual(report["summary"]["total"], 0)
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(report["static_summary"]["total"], 1)
+        self.assertEqual(report["llm_review_summary"]["total"], 0)
 
 
 if __name__ == "__main__":

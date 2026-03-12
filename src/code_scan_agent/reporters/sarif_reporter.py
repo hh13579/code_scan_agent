@@ -33,7 +33,7 @@ def _build_rule_index(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def render_sarif_report(report: dict[str, Any]) -> dict[str, Any]:
-    findings = list(report.get("merged_findings") or report.get("findings") or [])
+    findings = list(report.get("findings") or report.get("merged_findings") or [])
     results: list[dict[str, Any]] = []
 
     for item in findings:

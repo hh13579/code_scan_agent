@@ -140,9 +140,9 @@ def render_markdown_zh(report: dict[str, Any], opts: ZhReportOptions | None = No
     if opts.show_source_summary:
         lines.append("### 1.1 分来源统计")
         lines.append("")
-        lines.append(f"- 静态扫描：{_as_int(static_summary.get('total', len(static_findings)))} 条")
+        lines.append(f"- 静态扫描：{_as_int(static_summary.get('total', len(static_findings)))} 条（仅作为 LLM 审查辅助证据，不单独展开）")
         lines.append(f"- LLM 语义审查：{_as_int(llm_review_summary.get('total', len(llm_review_findings)))} 条")
-        lines.append(f"- 合并结果：{_as_int(merged_summary.get('total', len(findings)))} 条")
+        lines.append(f"- 报告展示结果：{_as_int(merged_summary.get('total', len(findings)))} 条")
         lines.append("")
 
     # 2. 文件分布
@@ -190,8 +190,8 @@ def render_markdown_zh(report: dict[str, Any], opts: ZhReportOptions | None = No
             lines.append(f"\n> 说明：LLM 语义审查问题共 {len(llm_review_findings)} 条，仅展示前 {len(llm_sorted)} 条。")
     lines.append("")
 
-    # 5. 全量问题列表
-    lines.append("## 5. 全量问题列表（按严重级排序，可能截断）")
+    # 5. 报告问题列表
+    lines.append("## 5. 报告问题列表（仅展示 LLM 审查结果，按严重级排序，可能截断）")
     lines.append("")
     if not findings_sorted:
         lines.append("- 无问题")
@@ -225,6 +225,7 @@ def render_markdown_zh(report: dict[str, Any], opts: ZhReportOptions | None = No
     lines.append("---")
     lines.append("### 备注")
     lines.append("- 本报告由结构化扫描结果模板生成。")
+    lines.append("- 静态分析结果默认仅用于辅助 LLM 判断，不在主报告中单独展开。")
     lines.append("- 建议优先处理：阻塞合并 / 致命 / 高优先级问题。")
     lines.append("- LLM 语义审查结果用于补充静态扫描难以发现的逻辑风险，不建议直接作为唯一 CI gate。")
     lines.append("")

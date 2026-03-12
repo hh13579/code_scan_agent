@@ -38,6 +38,7 @@ class MarkdownReporterZhTest(unittest.TestCase):
 
         self.assertEqual(legacy, current)
         self.assertIn("## 0. 本次最值得关注的问题", legacy)
+        self.assertIn("仅作为 LLM 审查辅助证据，不单独展开", legacy)
 
     def test_top_issues_order_and_string_evidence_are_preserved(self) -> None:
         report = {

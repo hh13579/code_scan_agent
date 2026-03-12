@@ -155,8 +155,8 @@ def _build_top_issues(findings: list[dict[str, Any]], max_items: int = 5) -> lis
 def build_report(state: GraphState) -> GraphState:
     """
     优先级：
-    1. merged_findings
-    2. triaged_findings
+    1. merged_findings / llm_review_findings（主报告默认只展示 LLM 审查结果）
+    2. triaged_findings（仅作为旧流程兼容 fallback）
     3. normalized_findings
 
     额外输出：
@@ -174,32 +174,38 @@ def build_report(state: GraphState) -> GraphState:
     llm_review_findings = _safe_findings(state.get("llm_review_findings") or [])
     merged_findings = _safe_findings(
         state.get("merged_findings")
-        or state.get("triaged_findings")
-        or state.get("normalized_findings")
         or []
     )
+    display_findings = merged_findings or llm_review_findings
+    has_llm_pipeline_fields = "merged_findings" in state or "llm_review_findings" in state
+    if not has_llm_pipeline_fields:
+        display_findings = _safe_findings(
+            state.get("triaged_findings")
+            or state.get("normalized_findings")
+            or []
+        )
 
-    grouped_by_file = _group_by_file(merged_findings)
-    grouped_by_severity = _group_by_severity(merged_findings)
+    grouped_by_file = _group_by_file(display_findings)
+    grouped_by_severity = _group_by_severity(display_findings)
 
     static_grouped_by_file = _group_by_file(static_findings)
     static_grouped_by_severity = _group_by_severity(static_findings)
 
     llm_grouped_by_file = _group_by_file(llm_review_findings)
     llm_grouped_by_severity = _group_by_severity(llm_review_findings)
-    merged_grouped_by_file = _group_by_file(merged_findings)
-    merged_grouped_by_severity = _group_by_severity(merged_findings)
+    merged_grouped_by_file = _group_by_file(display_findings)
+    merged_grouped_by_severity = _group_by_severity(display_findings)
 
-    merged_summary = _build_summary(merged_findings)
+    merged_summary = _build_summary(display_findings)
     static_summary = _build_summary(static_findings)
     llm_review_summary = _build_summary(llm_review_findings)
 
-    top_issues = _build_top_issues(merged_findings, max_items=5)
+    top_issues = _build_top_issues(display_findings, max_items=5)
 
     report = {
-        # 默认主视图 = merged
+        # 默认主视图 = 可报告结果（优先 LLM 审查）
         "summary": merged_summary,
-        "findings": merged_findings,
+        "findings": display_findings,
         "grouped_by_file": grouped_by_file,
         "grouped_by_severity": grouped_by_severity,
 
@@ -213,7 +219,7 @@ def build_report(state: GraphState) -> GraphState:
 
         "static_findings": static_findings,
         "llm_review_findings": llm_review_findings,
-        "merged_findings": merged_findings,
+        "merged_findings": display_findings,
 
         "static_grouped_by_file": static_grouped_by_file,
         "static_grouped_by_severity": static_grouped_by_severity,
@@ -229,7 +235,7 @@ def build_report(state: GraphState) -> GraphState:
         "build_report: "
         f"static={static_summary['total']}, "
         f"llm_review={llm_review_summary['total']}, "
-        f"merged={merged_summary['total']}, "
+        f"reportable={merged_summary['total']}, "
         f"top_issues={len(top_issues)}"
     )
     return state

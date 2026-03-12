@@ -4,12 +4,14 @@ import json
 import os
 import re
 import shlex
+import tempfile
 import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from code_scan_agent.graph.state import GraphState, ToolResult
+from code_scan_agent.tools.path_filters import is_generated_code_path
 from code_scan_agent.tools.shell_runner import is_command_available, run_command
 
 
@@ -106,6 +108,8 @@ def _third_party_prefixes() -> list[str]:
 
 
 def _is_cpp_source_file(rel_path: str) -> bool:
+    if is_generated_code_path(rel_path):
+        return False
     ext = Path(rel_path).suffix.lower()
     if ext in _CPP_HEADER_EXTS:
         return False
@@ -229,6 +233,68 @@ def _parse_clang_tidy_output(stdout: str, stderr: str) -> list[dict[str, Any]]:
         )
 
     return findings
+
+
+def _build_filtered_compile_db(
+    repo_path: Path,
+    compile_db_path: str,
+    include_files: list[str],
+) -> tuple[str | None, list[str]]:
+    logs: list[str] = []
+    repo_root = repo_path.resolve()
+    include_set = {_normalize_rel_path(path) for path in include_files}
+    if not include_set:
+        return None, logs
+
+    compile_db = Path(compile_db_path).resolve()
+    try:
+        data = json.loads(compile_db.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logs.append(f"compile_db filter: failed to read {compile_db}: {exc}")
+        return None, logs
+
+    if not isinstance(data, list):
+        logs.append(f"compile_db filter: unexpected JSON root in {compile_db}")
+        return None, logs
+
+    filtered: list[dict[str, Any]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        raw_file = item.get("file")
+        if not isinstance(raw_file, str) or not raw_file.strip():
+            continue
+        raw_dir = item.get("directory")
+        if Path(raw_file).is_absolute():
+            abs_file = Path(raw_file).resolve()
+        elif isinstance(raw_dir, str) and raw_dir.strip():
+            abs_file = (Path(raw_dir) / raw_file).resolve()
+        else:
+            abs_file = (repo_root / raw_file).resolve()
+        if not abs_file.is_relative_to(repo_root):
+            continue
+        rel = _normalize_rel_path(str(abs_file.relative_to(repo_root)))
+        if rel not in include_set or is_generated_code_path(rel):
+            continue
+        filtered.append(item)
+
+    if not filtered:
+        logs.append("compile_db filter: no matching units, fallback to file list")
+        return None, logs
+
+    temp_file = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        suffix=".json",
+        prefix="code_scan_compile_db_",
+        delete=False,
+    )
+    with temp_file:
+        json.dump(filtered, temp_file, ensure_ascii=False)
+    logs.append(
+        f"compile_db filter: kept={len(filtered)}/{len(data)} entries for cppcheck project mode"
+    )
+    return temp_file.name, logs
 
 
 def _parse_cppcheck_xml(stderr_xml: str) -> list[dict[str, Any]]:
@@ -454,28 +520,47 @@ def _run_cppcheck(
     ]
     for prefix in third_party_prefixes:
         cmd.extend(["-i", prefix.rstrip("/")])
-    if compile_db_path:
-        cmd.append(f"--project={compile_db_path}")
-    else:
-        cmd.extend(cpp_files)
-    cmd.extend(extra_args or [])
+    filtered_compile_db_path: str | None = None
+    try:
+        if compile_db_path:
+            filtered_compile_db_path, filter_logs = _build_filtered_compile_db(
+                repo_path=repo_path,
+                compile_db_path=compile_db_path,
+                include_files=cpp_files,
+            )
+            logs.extend(filter_logs)
+        if filtered_compile_db_path:
+            cmd.append(f"--project={filtered_compile_db_path}")
+        else:
+            cmd.extend(cpp_files)
+        cmd.extend(extra_args or [])
 
-    result = run_command(cmd, cwd=repo_path, timeout_sec=timeout_sec, check=False)
-    total_duration_ms += result.get("duration_ms", 0)
+        result = run_command(cmd, cwd=repo_path, timeout_sec=timeout_sec, check=False)
+        total_duration_ms += result.get("duration_ms", 0)
 
-    if result.get("error"):
-        logs.append(f"cppcheck error: {result['error']}")
+        if result.get("error"):
+            logs.append(f"cppcheck error: {result['error']}")
+            return findings, logs, total_duration_ms
+
+        parsed_findings = _parse_cppcheck_xml(result.get("stderr", "") or result.get("stdout", ""))
+        findings = [
+            finding
+            for finding in parsed_findings
+            if not is_generated_code_path(str(finding.get("file", "")))
+        ]
+        mode = "project" if filtered_compile_db_path else "files"
+        logs.append(f"cppcheck: exit={result.get('exit_code')}, findings={len(findings)}, mode={mode}")
+        if int(result.get("exit_code", 0)) != 0 and not findings:
+            reason = _extract_failure_reason(result)
+            logs.append(f"cppcheck failure summary: {reason}")
+
         return findings, logs, total_duration_ms
-
-    # cppcheck 的 XML 常在 stderr
-    findings = _parse_cppcheck_xml(result.get("stderr", "") or result.get("stdout", ""))
-    mode = "project" if compile_db_path else "files"
-    logs.append(f"cppcheck: exit={result.get('exit_code')}, findings={len(findings)}, mode={mode}")
-    if int(result.get("exit_code", 0)) != 0 and not findings:
-        reason = _extract_failure_reason(result)
-        logs.append(f"cppcheck failure summary: {reason}")
-
-    return findings, logs, total_duration_ms
+    finally:
+        if filtered_compile_db_path:
+            try:
+                Path(filtered_compile_db_path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _run_builtin_cpp_pattern_scan(

@@ -5,6 +5,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 from code_scan_agent.graph.state import GraphState
+from code_scan_agent.tools.path_filters import is_generated_code_path
 from code_scan_agent.tools.repo.git_diff import DiffMode, get_git_diff_files
 
 
@@ -60,6 +61,7 @@ def collect_targets(state: GraphState) -> GraphState:
     selected_paths = list(request.get("selected_paths", []))
     diff_changed_lines: dict[str, list[int]] = {}
     diff_files_state: list[dict[str, object]] = []
+    skipped_generated = 0
 
     selected_set: set[str] = set()
     for p in selected_paths:
@@ -101,6 +103,9 @@ def collect_targets(state: GraphState) -> GraphState:
         for item in raw_diff_files:
             rel_path = str(item.get("path", ""))
             if not rel_path:
+                continue
+            if is_generated_code_path(rel_path):
+                skipped_generated += 1
                 continue
             if any(rel_path.startswith(prefix) for prefix in _DEFAULT_EXCLUDE_PREFIXES):
                 continue
@@ -146,6 +151,9 @@ def collect_targets(state: GraphState) -> GraphState:
             continue
 
         rel_path = str(file_path.relative_to(repo_path)).replace("\\", "/")
+        if is_generated_code_path(rel_path):
+            skipped_generated += 1
+            continue
 
         if any(rel_path.startswith(prefix) for prefix in _DEFAULT_EXCLUDE_PREFIXES):
             continue
@@ -178,4 +186,8 @@ def collect_targets(state: GraphState) -> GraphState:
     state.setdefault("logs", []).append(
         f"collect_targets: mode={mode}, total_targets={len(targets)}"
     )
+    if skipped_generated:
+        state.setdefault("logs", []).append(
+            f"collect_targets: skipped_generated={skipped_generated}"
+        )
     return state

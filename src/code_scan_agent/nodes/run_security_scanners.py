@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from code_scan_agent.graph.state import GraphState, ToolResult
+from code_scan_agent.tools.path_filters import generated_code_globs
 from code_scan_agent.tools.shell_runner import is_command_available, run_command
 
 
@@ -130,6 +131,8 @@ def _build_semgrep_cmd(repo_path: Path, state: GraphState) -> list[str]:
     ]
 
     for pattern in _DEFAULT_EXCLUDES:
+        cmd.extend(["--exclude", pattern])
+    for pattern in generated_code_globs():
         cmd.extend(["--exclude", pattern])
     for pattern in exclude_globs:
         cmd.extend(["--exclude", pattern])
