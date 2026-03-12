@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 from code_scan_agent.graph.builder import build_graph
 from code_scan_agent.graph.state import GraphState
 from code_scan_agent.tools.local_env import load_local_env
+from code_scan_agent.tools.repo.ref_workspace import detached_ref_workspace
 
 _FAIL_ON_LEVELS = ("critical", "high", "medium", "low", "info")
 _FAIL_ON_INDEX = {level: idx for idx, level in enumerate(_FAIL_ON_LEVELS)}
@@ -89,6 +91,10 @@ def _build_request_from_target(
     if enable_llm_triage is not None:
         request["enable_llm_triage"] = enable_llm_triage
     return request
+
+
+def _should_use_ref_workspace(*, target: Path, mode: str, diff_head_ref: str, diff_commit: str, diff_staged: bool) -> bool:
+    return bool(target.is_dir() and mode == "diff" and diff_head_ref and not diff_commit and not diff_staged)
 
 
 def _write_report(out_path: Path, report_text: str) -> None:
@@ -284,120 +290,143 @@ def main() -> int:
         print(f"Invalid arguments: {e}")
         return 1
 
-    app = build_graph()
-
-    init_state: GraphState = {
-        "request": request,  # type: ignore[typeddict-item]
-        "errors": [],
-        "logs": [],
-        "raw_tool_results": [],
-        "diff_files": [],
-        "normalized_findings": [],
-        "triaged_findings": [],
-        "llm_review_findings": [],
-        "static_findings": [],
-        "merged_findings": [],
-    }
-
-    result = app.invoke(init_state)
-    report = result.get("report", {})
-    report_text = json.dumps(report, ensure_ascii=False, indent=2)
-    errors = list(result.get("errors", []))
-    logs = list(result.get("logs", []))
-
-    if args.out:
-        out_path = Path(args.out).expanduser().resolve()
-        try:
-            _write_report(out_path, report_text)
-        except OSError as e:
-            print(f"\nFailed to write report: {out_path}: {e}")
-            return 1
-
-    else:
-        out_path = None
-
-    if args.out_zh:
-        from code_scan_agent.reporters.markdown_reporter_zh import render_markdown_report_zh
-
-        out_zh_path = Path(args.out_zh).expanduser().resolve()
-        try:
-            _write_report(out_zh_path, render_markdown_report_zh(report if isinstance(report, dict) else {}))
-        except OSError as e:
-            print(f"\nFailed to write Chinese markdown report: {out_zh_path}: {e}")
-            return 1
-
-    if args.out_sarif:
-        from code_scan_agent.reporters.sarif_reporter import render_sarif_report
-
-        out_sarif_path = Path(args.out_sarif).expanduser().resolve()
-        try:
-            _write_report(
-                out_sarif_path,
-                json.dumps(render_sarif_report(report if isinstance(report, dict) else {}), ensure_ascii=False, indent=2),
-            )
-        except OSError as e:
-            print(f"\nFailed to write SARIF report: {out_sarif_path}: {e}")
-            return 1
-
-    run_output_text = _render_run_output(
-        report_text=report_text,
-        errors=errors,
-        logs=logs,
-        report_out_path=out_path,
-    )
-    print(run_output_text, end="")
-
-    if args.log_out:
-        log_out_path = Path(args.log_out).expanduser().resolve()
-        try:
-            _write_report(log_out_path, run_output_text.rstrip("\n"))
-        except OSError as e:
-            print(f"\nFailed to write log output: {log_out_path}: {e}")
-            return 1
-    else:
-        log_out_path = None
-
-    if args.cn_report_out:
-        from code_scan_agent.tools.deepseek_cn_report import generate_cn_report_from_content
-
-        repo_path = Path(str(request.get("repo_path", raw_target))).expanduser().resolve()
-        base_ref = str(request.get("diff_base_ref") or request.get("base_ref") or "").strip()
-        head_ref = str(request.get("diff_head_ref") or request.get("head_ref") or "").strip()
-        cn_report_out = Path(args.cn_report_out).expanduser().resolve()
-        cn_report_json_out = (
-            Path(args.cn_report_json_out).expanduser().resolve()
-            if args.cn_report_json_out
-            else None
+    source_repo_path = Path(str(request.get("repo_path", raw_target))).expanduser().resolve()
+    ref_workspace_cm = (
+        detached_ref_workspace(source_repo_path, diff_head_ref)
+        if _should_use_ref_workspace(
+            target=raw_target,
+            mode=str(request.get("mode", "")),
+            diff_head_ref=diff_head_ref,
+            diff_commit=diff_commit,
+            diff_staged=args.diff_staged,
         )
-        try:
-            cn_result = generate_cn_report_from_content(
-                report=report if isinstance(report, dict) else {},
-                log_text=run_output_text,
-                repo_path=repo_path,
-                base_ref=base_ref,
-                head_ref=head_ref,
-                out_path=cn_report_out,
-                raw_out_path=cn_report_json_out,
-                context_lines=args.cn_report_context_lines,
-                diff_context=args.cn_report_diff_context,
-                max_findings=args.cn_report_max_findings,
-                allow_local_fallback=args.cn_report_local_fallback,
+        else nullcontext(None)
+    )
+
+    with ref_workspace_cm as ref_repo_path:
+        if ref_repo_path is not None:
+            request["source_repo_path"] = str(source_repo_path)
+            request["repo_path"] = str(Path(ref_repo_path).resolve())
+
+        app = build_graph()
+
+        init_state: GraphState = {
+            "request": request,  # type: ignore[typeddict-item]
+            "errors": [],
+            "logs": [],
+            "raw_tool_results": [],
+            "diff_files": [],
+            "normalized_findings": [],
+            "triaged_findings": [],
+            "llm_review_findings": [],
+            "static_findings": [],
+            "merged_findings": [],
+        }
+        if ref_repo_path is not None:
+            init_state["logs"] = [
+                f"main: using detached ref workspace head_ref={diff_head_ref}, repo_path={Path(ref_repo_path).resolve()}"
+            ]
+
+        result = app.invoke(init_state)
+        report = result.get("report", {})
+        report_text = json.dumps(report, ensure_ascii=False, indent=2)
+        errors = list(result.get("errors", []))
+        logs = list(result.get("logs", []))
+
+        if args.out:
+            out_path = Path(args.out).expanduser().resolve()
+            try:
+                _write_report(out_path, report_text)
+            except OSError as e:
+                print(f"\nFailed to write report: {out_path}: {e}")
+                return 1
+
+        else:
+            out_path = None
+
+        if args.out_zh:
+            from code_scan_agent.reporters.markdown_reporter_zh import render_markdown_report_zh
+
+            out_zh_path = Path(args.out_zh).expanduser().resolve()
+            try:
+                _write_report(out_zh_path, render_markdown_report_zh(report if isinstance(report, dict) else {}))
+            except OSError as e:
+                print(f"\nFailed to write Chinese markdown report: {out_zh_path}: {e}")
+                return 1
+
+        if args.out_sarif:
+            from code_scan_agent.reporters.sarif_reporter import render_sarif_report
+
+            out_sarif_path = Path(args.out_sarif).expanduser().resolve()
+            try:
+                _write_report(
+                    out_sarif_path,
+                    json.dumps(render_sarif_report(report if isinstance(report, dict) else {}), ensure_ascii=False, indent=2),
+                )
+            except OSError as e:
+                print(f"\nFailed to write SARIF report: {out_sarif_path}: {e}")
+                return 1
+
+        run_output_text = _render_run_output(
+            report_text=report_text,
+            errors=errors,
+            logs=logs,
+            report_out_path=out_path,
+        )
+        print(run_output_text, end="")
+
+        if args.log_out:
+            log_out_path = Path(args.log_out).expanduser().resolve()
+            try:
+                _write_report(log_out_path, run_output_text.rstrip("\n"))
+            except OSError as e:
+                print(f"\nFailed to write log output: {log_out_path}: {e}")
+                return 1
+        else:
+            log_out_path = None
+
+        if args.cn_report_out:
+            from code_scan_agent.tools.deepseek_cn_report import generate_cn_report_from_content
+
+            repo_path = Path(str(request.get("repo_path", raw_target))).expanduser().resolve()
+            base_ref = str(request.get("diff_base_ref") or request.get("base_ref") or "").strip()
+            head_ref = str(request.get("diff_head_ref") or request.get("head_ref") or "").strip()
+            cn_report_out = Path(args.cn_report_out).expanduser().resolve()
+            cn_report_json_out = (
+                Path(args.cn_report_json_out).expanduser().resolve()
+                if args.cn_report_json_out
+                else None
             )
-        except Exception as e:  # noqa: BLE001
-            print(f"\nFailed to generate Chinese report: {e}")
-            return 1
+            try:
+                cn_result = generate_cn_report_from_content(
+                    report=report if isinstance(report, dict) else {},
+                    log_text=run_output_text,
+                    repo_path=repo_path,
+                    display_repo_path=source_repo_path,
+                    base_ref=base_ref,
+                    head_ref=head_ref,
+                    out_path=cn_report_out,
+                    raw_out_path=cn_report_json_out,
+                    context_lines=args.cn_report_context_lines,
+                    diff_context=args.cn_report_diff_context,
+                    max_findings=args.cn_report_max_findings,
+                    allow_local_fallback=args.cn_report_local_fallback,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"\nFailed to generate Chinese report: {e}")
+                return 1
 
-        print(f"\nChinese report written to: {cn_result['markdown_path']}")
-        print(f"Chinese report JSON written to: {cn_result['json_path']}")
-        print(f"Chinese report generated by: {cn_result['generated_by']}")
+            print(f"\nChinese report written to: {cn_result['markdown_path']}")
+            print(f"Chinese report JSON written to: {cn_result['json_path']}")
+            print(f"Chinese report generated by: {cn_result['generated_by']}")
 
-    if args.fail_on:
-        summary = report.get("summary", {})
-        if isinstance(summary, dict):
-            matched = _count_failures_at_or_above(summary, args.fail_on)
-            if matched > 0:
-                print(f"\nFail-on threshold hit: severity>={args.fail_on}, matched_findings={matched}")
-                return 2
+        if args.fail_on:
+            summary = report.get("summary", {})
+            if isinstance(summary, dict):
+                matched = _count_failures_at_or_above(summary, args.fail_on)
+                if matched > 0:
+                    print(f"\nFail-on threshold hit: severity>={args.fail_on}, matched_findings={matched}")
+                    return 2
 
     return 0
 

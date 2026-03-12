@@ -37,6 +37,12 @@ _KEY_LOG_MARKERS = (
     "Errors:",
 )
 _SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+_REVIEW_ACTION_TO_JUDGEMENT = {
+    "block": "建议修复",
+    "should_fix": "建议修复",
+    "follow_up": "需要人工确认",
+}
+_CONFIDENCE_ZH = {"high": "高", "medium": "中", "low": "低"}
 
 
 def _get_int_env(name: str, default: int, min_value: int | None = None) -> int:
@@ -205,14 +211,57 @@ def _extract_key_logs(log_text: str) -> list[str]:
     return lines
 
 
-def _read_code_context(repo_path: Path, rel_file: str, line_number: int | None, context_lines: int) -> str:
+def _read_file_at_ref(repo_path: Path, git_ref: str, rel_file: str) -> str | None:
+    if not git_ref or not rel_file:
+        return None
+    try:
+        return _run_git(repo_path, ["show", f"{git_ref}:{rel_file}"])
+    except RuntimeError:
+        return None
+
+
+def _resolve_ref_sha(repo_path: Path, git_ref: str) -> str:
+    if not git_ref:
+        return ""
+    try:
+        return _run_git(repo_path, ["rev-parse", git_ref]).strip()
+    except RuntimeError:
+        return ""
+
+
+def _resolve_current_checkout(repo_path: Path) -> dict[str, str]:
+    info = {"ref": "", "sha": ""}
+    if not repo_path.is_dir():
+        return info
+    try:
+        info["ref"] = _run_git(repo_path, ["branch", "--show-current"]).strip()
+    except RuntimeError:
+        info["ref"] = ""
+    try:
+        info["sha"] = _run_git(repo_path, ["rev-parse", "HEAD"]).strip()
+    except RuntimeError:
+        info["sha"] = ""
+    return info
+
+
+def _read_code_context(
+    repo_path: Path,
+    rel_file: str,
+    line_number: int | None,
+    context_lines: int,
+    *,
+    git_ref: str = "",
+) -> str:
     if not rel_file:
         return "(code context unavailable: empty file path)"
-    file_path = repo_path / rel_file
-    if not file_path.is_file():
-        return "(code context unavailable: file not found in working tree)"
+    text_content = _read_file_at_ref(repo_path, git_ref, rel_file) if git_ref else None
+    if text_content is None:
+        file_path = repo_path / rel_file
+        if not file_path.is_file():
+            return "(code context unavailable: file not found in ref or working tree)"
+        text_content = file_path.read_text(encoding="utf-8", errors="replace")
 
-    text = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    text = text_content.splitlines()
     if not text:
         return "(code context unavailable: empty file)"
 
@@ -322,6 +371,7 @@ def build_payload(
     report: dict[str, Any],
     log_text: str,
     repo_path: Path,
+    display_repo_path: Path | None,
     base_ref: str,
     head_ref: str,
     context_lines: int,
@@ -329,6 +379,8 @@ def build_payload(
     max_findings: int,
 ) -> dict[str, Any]:
     key_logs = _extract_key_logs(log_text)
+    display_repo = display_repo_path or repo_path
+    findings_all = list(report.get("findings", []))
     findings_payload = []
     for finding in _normalize_findings(report, max_findings=max_findings):
         rel_file = str(finding.get("file", ""))
@@ -340,62 +392,59 @@ def build_payload(
                 "severity": str(finding.get("severity", "info")),
                 "tool": str(finding.get("tool", "")),
                 "rule_id": str(finding.get("rule_id", "")),
+                "source": str(finding.get("source", "")),
+                "category": str(finding.get("category", "")),
+                "title": str(finding.get("title", "")),
                 "message": str(finding.get("message", "")),
+                "impact": str(finding.get("impact", "")),
                 "confidence": str(finding.get("confidence", "")),
+                "review_action": str(finding.get("review_action", "")),
+                "evidence": finding.get("evidence", []),
+                "suggested_action": str(finding.get("suggested_action", "")),
                 "in_diff": bool(finding.get("in_diff", False)),
-                "code_context": _read_code_context(repo_path, rel_file, line_number, context_lines),
+                "code_context": _read_code_context(repo_path, rel_file, line_number, context_lines, git_ref=head_ref),
                 "diff_hunk": _read_diff_hunk(repo_path, base_ref, head_ref, rel_file, line_number, diff_context),
             }
         )
 
+    head_sha = _resolve_ref_sha(repo_path, head_ref)
+    current_checkout = _resolve_current_checkout(display_repo)
+    current_ref = current_checkout.get("ref", "")
+    current_sha = current_checkout.get("sha", "")
+    is_historical_snapshot = bool(head_sha and current_sha and head_sha != current_sha)
+
     return {
         "scan_meta": {
-            "repo_path": str(repo_path),
+            "repo_path": str(display_repo),
+            "effective_repo_path": str(repo_path),
             "base_ref": base_ref,
             "head_ref": head_ref,
+            "head_sha": head_sha,
+            "current_checkout_ref": current_ref,
+            "current_checkout_sha": current_sha,
+            "is_historical_snapshot": is_historical_snapshot,
         },
         "report_summary": report.get("summary", {}),
+        "static_summary": report.get("static_summary", {}),
+        "llm_review_summary": report.get("llm_review_summary", {}),
+        "merged_summary": report.get("merged_summary", {}),
+        "top_issues": report.get("top_issues", []),
         "key_logs": key_logs,
+        "total_findings_count": len(findings_all),
+        "displayed_findings_count": len(findings_payload),
         "findings": findings_payload,
     }
 
 
-def _build_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
-    system_prompt = (
-        "你是资深 C/C++ 代码审查工程师。"
-        "你会基于静态扫描结果、运行日志、代码上下文和 diff hunk 输出一份谨慎的中文审查报告。"
-        "不要编造未给出的代码事实。"
-        "如果某条告警像误报或行号错位，要明确指出。"
-        "输出必须是严格 JSON。"
-    )
-    user_prompt = (
-        "请阅读下面的输入，输出严格 JSON，对扫描结果生成中文审查报告。\n"
-        "JSON 顶层字段必须且只能包含：\n"
-        "title(string),\n"
-        "summary(object: scope, overall_risk, conclusion, tool_observations[array of string], coverage_limits[array of string]),\n"
-        "findings(array of object: file, line, severity, tool, rule_id, judgement, confidence, why, impact, fix_advice),\n"
-        "next_actions(array of string).\n"
-        "要求：\n"
-        "1. judgement 只能是：建议修复、可暂缓、疑似误报、需要人工确认。\n"
-        "2. confidence 用：高、中、低。\n"
-        "3. summary.overall_risk 用：低、中、高。\n"
-        "4. 结合代码上下文和 diff hunk，判断每条 finding 的真实价值，不要机械复述工具原文。\n"
-        "5. 如果工具覆盖有缺失或降级执行，要写进 coverage_limits。\n"
-        "6. findings 顺序按风险和处理价值排序。\n\n"
-        f"input={json.dumps(payload, ensure_ascii=False)}"
-    )
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+def _normalize_evidence(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()][:5]
+    text = str(value).strip()
+    return [text] if text else []
 
 
-def _guess_overall_risk(summary: dict[str, Any]) -> str:
-    if int(summary.get("critical", 0) or 0) > 0 or int(summary.get("high", 0) or 0) > 0:
-        return "高"
-    if int(summary.get("medium", 0) or 0) > 0:
-        return "中"
-    return "低"
+def _to_confidence_zh(value: str) -> str:
+    return _CONFIDENCE_ZH.get(value.strip().lower(), value.strip() or "低")
 
 
 def _local_judgement(finding: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -413,8 +462,8 @@ def _local_judgement(finding: dict[str, Any]) -> tuple[str, str, str, str]:
         return (
             "可暂缓",
             "中",
-            "这类告警更偏向签名或封装层面的优化建议，不直接指向行为缺陷；在重构后也可能出现行号或符号错位。",
-            "结合当前实现确认告警是否命中真实函数；若属实，可在后续代码整理时顺手修复。",
+            "这类告警更偏向签名或封装层面的优化建议，不直接指向行为缺陷；需要结合实现确认是否值得顺手清理。",
+            "若确认无成员访问或无写操作，可在后续整理时将其改为 static 或 const&。",
         )
     if severity in {"critical", "high", "medium"}:
         return (
@@ -431,11 +480,32 @@ def _local_judgement(finding: dict[str, Any]) -> tuple[str, str, str, str]:
     )
 
 
-def _local_fallback_analysis(payload: dict[str, Any], reason: str) -> dict[str, Any]:
-    summary = dict(payload.get("report_summary", {}))
-    findings = []
+def _build_cn_findings(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
     for item in payload.get("findings", []):
-        judgement, confidence, why, fix_advice = _local_judgement(item)
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source", "")).strip().lower()
+        review_action = str(item.get("review_action", "")).strip().lower()
+        evidence = _normalize_evidence(item.get("evidence"))
+        confidence_raw = str(item.get("confidence", "")).strip().lower()
+        message = str(item.get("message", "")).strip()
+        title = str(item.get("title", "")).strip()
+        impact = str(item.get("impact", "")).strip()
+        suggested_action = str(item.get("suggested_action", "")).strip()
+
+        if source == "llm_diff_review":
+            judgement = _REVIEW_ACTION_TO_JUDGEMENT.get(review_action, "需要人工确认")
+            confidence = _to_confidence_zh(confidence_raw or "low")
+            why = message or title or "LLM 基于 diff 和上下文识别出潜在语义风险。"
+            if not impact:
+                impact = "当前上下文不足以确认明确故障后果，建议结合调用链做一次人工复核。"
+            fix_advice = suggested_action or "结合具体调用路径确认问题是否成立，再决定是否在本次修复。"
+        else:
+            judgement, confidence, why, fix_advice = _local_judgement(item)
+            if not impact:
+                impact = "这是低优先级代码质量或可维护性问题，通常不会直接改变运行时行为。"
+
         findings.append(
             {
                 "file": item.get("file", ""),
@@ -443,14 +513,86 @@ def _local_fallback_analysis(payload: dict[str, Any], reason: str) -> dict[str, 
                 "severity": item.get("severity", "info"),
                 "tool": item.get("tool", ""),
                 "rule_id": item.get("rule_id", ""),
+                "title": title,
                 "judgement": judgement,
                 "confidence": confidence,
                 "why": why,
-                "impact": "当前没有看到会直接导致崩溃或错误结果的证据，更多是可读性或维护性影响。",
+                "impact": impact,
                 "fix_advice": fix_advice,
+                "review_action": review_action,
+                "evidence": evidence,
             }
         )
+    return findings
 
+
+def _build_summary_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    findings = _build_cn_findings(payload)
+    finding_summaries = []
+    for item in findings[:12]:
+        finding_summaries.append(
+            {
+                "file": item.get("file", ""),
+                "line": item.get("line"),
+                "severity": item.get("severity", ""),
+                "tool": item.get("tool", ""),
+                "rule_id": item.get("rule_id", ""),
+                "title": item.get("title", ""),
+                "judgement": item.get("judgement", ""),
+                "impact": item.get("impact", ""),
+                "review_action": item.get("review_action", ""),
+                "evidence": item.get("evidence", []),
+            }
+        )
+    return {
+        "scan_meta": payload.get("scan_meta", {}),
+        "report_summary": payload.get("report_summary", {}),
+        "static_summary": payload.get("static_summary", {}),
+        "llm_review_summary": payload.get("llm_review_summary", {}),
+        "merged_summary": payload.get("merged_summary", {}),
+        "top_issues": payload.get("top_issues", []),
+        "key_logs": payload.get("key_logs", []),
+        "findings": finding_summaries,
+    }
+
+
+def _build_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
+    system_prompt = (
+        "你是资深 C/C++ 代码审查工程师。"
+        "你会基于已结构化的扫描结果和关键日志，输出一份谨慎的中文摘要。"
+        "不要编造未给出的代码事实。"
+        "输出必须是严格 JSON。"
+    )
+    summary_payload = _build_summary_payload(payload)
+    user_prompt = (
+        "请阅读下面的输入，输出严格 JSON，对扫描结果生成中文摘要。\n"
+        "JSON 顶层字段必须且只能包含：\n"
+        "title(string),\n"
+        "summary(object: scope, overall_risk, conclusion, tool_observations[array of string], coverage_limits[array of string]),\n"
+        "next_actions(array of string).\n"
+        "要求：\n"
+        "1. summary.overall_risk 用：低、中、高。\n"
+        "2. 只总结已提供的结构化 findings，不要新增、删除或改判具体 finding。\n"
+        "3. 如果工具覆盖有缺失或上下文不足，要写进 coverage_limits。\n"
+        "4. 不要复述无关日志。\n\n"
+        f"input={json.dumps(summary_payload, ensure_ascii=False)}"
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def _guess_overall_risk(summary: dict[str, Any]) -> str:
+    if int(summary.get("critical", 0) or 0) > 0 or int(summary.get("high", 0) or 0) > 0:
+        return "高"
+    if int(summary.get("medium", 0) or 0) > 0:
+        return "中"
+    return "低"
+
+
+def _local_fallback_summary(payload: dict[str, Any], reason: str) -> dict[str, Any]:
+    summary = dict(payload.get("report_summary", {}))
     tool_observations = []
     coverage_limits = [f"DeepSeek 未实际调用，原因：{reason}。以下结论为本地 fallback 生成。"]
     for line in payload.get("key_logs", []):
@@ -475,21 +617,28 @@ def _local_fallback_analysis(payload: dict[str, Any], reason: str) -> dict[str, 
                 f"比较 {payload['scan_meta']['base_ref']}...{payload['scan_meta']['head_ref']} 的增量改动。"
             ),
             "overall_risk": _guess_overall_risk(summary),
-            "conclusion": "本次命中的告警以低优先级代码质量建议为主，未看到高风险缺陷信号。",
+            "conclusion": "本报告直接基于第一阶段结构化 findings 生成；如需更高可信度，请结合实际代码上下文复核 top issues。",
             "tool_observations": tool_observations[:8],
             "coverage_limits": coverage_limits,
         },
-        "findings": findings,
         "next_actions": [
-            "优先人工确认命中的 1-3 条低优先级告警是否值得顺手修复。",
+            "优先复核首页列出的 top issues，确认是否与当前 head_ref 代码一致。",
             "如果要提高 C++ 覆盖度，在完整环境补齐 clang-tidy 后重新跑一次 diff 扫描。",
-            "如需正式中文结论，配置 DEEPSEEK_API_KEY 后重跑本工具以生成 DeepSeek 版报告。",
+            "如需正式中文摘要，配置 DEEPSEEK_API_KEY 后重跑本工具。",
         ],
     }
 
 
 def render_markdown(analysis: dict[str, Any], payload: dict[str, Any], generated_by: str) -> str:
     summary = analysis.get("summary", {})
+    scan_meta = payload.get("scan_meta", {})
+    base_ref = str(scan_meta.get("base_ref", "")).strip()
+    head_ref = str(scan_meta.get("head_ref", "")).strip()
+    head_sha = str(scan_meta.get("head_sha", "")).strip()
+    current_ref = str(scan_meta.get("current_checkout_ref", "")).strip()
+    current_sha = str(scan_meta.get("current_checkout_sha", "")).strip()
+    total_findings = int(payload.get("total_findings_count", 0) or 0)
+    displayed_findings = int(payload.get("displayed_findings_count", 0) or 0)
     lines = [
         f"# {analysis.get('title', '代码扫描中文报告')}",
         "",
@@ -497,14 +646,34 @@ def render_markdown(analysis: dict[str, Any], payload: dict[str, Any], generated
         "",
         "## 范围",
         f"- {summary.get('scope', '')}",
+        f"- 基线范围：`{base_ref}...{head_ref}`" + (f"（head_sha=`{head_sha}`）" if head_sha else ""),
         f"- 结论：{summary.get('conclusion', '')}",
         f"- 总体风险：{summary.get('overall_risk', '')}",
         "",
+    ]
+
+    if bool(scan_meta.get("is_historical_snapshot")):
+        current_checkout_label = current_ref or "(detached)"
+        current_sha_short = current_sha[:12] if current_sha else ""
+        suffix = f"（当前 checkout: `{current_checkout_label}` / `{current_sha_short}`）" if current_sha_short or current_checkout_label else ""
+        lines.extend(
+            [
+                "## 快照说明",
+                f"- 本报告结论基于 `head_ref` 对应的历史快照生成，不等同于你当前工作树中的文件状态。{suffix}",
+                "- 如果当前本地 checkout 不在上述 `head_ref/head_sha`，请不要直接用当前工作树代码去反驳本报告中的历史 diff 结论。",
+                "",
+            ]
+        )
+
+    lines.extend(
+        [
         "## 扫描摘要",
         f"- 原始 summary：`{json.dumps(payload.get('report_summary', {}), ensure_ascii=False)}`",
+        f"- 正文展示：前 `{displayed_findings}` 条 / 共 `{total_findings}` 条（完整结果见 JSON/SARIF 产物）",
         "",
         "## 工具观察",
-    ]
+        ]
+    )
 
     tool_observations = summary.get("tool_observations", [])
     if tool_observations:
@@ -522,6 +691,8 @@ def render_markdown(analysis: dict[str, Any], payload: dict[str, Any], generated
         lines.append("- 无")
 
     lines.extend(["", "## Findings"])
+    if total_findings > displayed_findings > 0:
+        lines.append(f"- 本节仅展开前 `{displayed_findings}` 条；其余结果请查看配套 JSON/SARIF。")
     findings = analysis.get("findings", [])
     if not findings:
         lines.append("- 无 finding。")
@@ -532,11 +703,14 @@ def render_markdown(analysis: dict[str, Any], payload: dict[str, Any], generated
                     f"### {idx}. {item.get('severity', '')} | {item.get('file', '')}:{item.get('line', '')}",
                     f"- 工具：`{item.get('tool', '')}`",
                     f"- 规则：`{item.get('rule_id', '')}`",
+                    f"- 标题：{item.get('title', '') or '无'}",
                     f"- 判断：{item.get('judgement', '')}",
                     f"- 置信度：{item.get('confidence', '')}",
+                    f"- 审查动作：{item.get('review_action', '') or '无'}",
                     f"- 原因：{item.get('why', '')}",
                     f"- 影响：{item.get('impact', '')}",
                     f"- 建议：{item.get('fix_advice', '')}",
+                    f"- 证据：{'；'.join(item.get('evidence', [])) if item.get('evidence') else '无'}",
                     "",
                 ]
             )
@@ -584,6 +758,7 @@ def generate_cn_report_from_content(
     report: dict[str, Any],
     log_text: str,
     repo_path: Path,
+    display_repo_path: Path | None = None,
     base_ref: str,
     head_ref: str,
     out_path: Path,
@@ -597,6 +772,7 @@ def generate_cn_report_from_content(
         report=report,
         log_text=log_text,
         repo_path=repo_path,
+        display_repo_path=display_repo_path,
         base_ref=base_ref,
         head_ref=head_ref,
         context_lines=max(context_lines, 1),
@@ -604,14 +780,22 @@ def generate_cn_report_from_content(
         max_findings=max(max_findings, 1),
     )
 
+    findings = _build_cn_findings(payload)
     generated_by = "DeepSeek"
     try:
-        analysis = _call_deepseek_with_retry(_build_messages(payload))
+        summary_analysis = _call_deepseek_with_retry(_build_messages(payload))
     except Exception as exc:  # noqa: BLE001
         if not allow_local_fallback:
             raise
         generated_by = "LocalFallback"
-        analysis = _local_fallback_analysis(payload, str(exc))
+        summary_analysis = _local_fallback_summary(payload, str(exc))
+
+    analysis = {
+        "title": summary_analysis.get("title", "代码扫描中文报告"),
+        "summary": summary_analysis.get("summary", {}),
+        "findings": findings,
+        "next_actions": summary_analysis.get("next_actions", []),
+    }
 
     markdown = render_markdown(analysis, payload, generated_by=generated_by)
     _write_text(out_path, markdown)
@@ -645,6 +829,7 @@ def generate_cn_report_from_paths(
         report=report,
         log_text=log_text,
         repo_path=repo_path,
+        display_repo_path=repo_path,
         base_ref=base_ref,
         head_ref=head_ref,
         out_path=out_path,

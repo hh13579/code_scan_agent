@@ -81,6 +81,35 @@ def _safe_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
+def _group_blocks_by_subject(
+    diff_blocks: list[dict[str, Any]],
+    extra_context_blocks: list[dict[str, Any]],
+) -> tuple[list[str], dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
+    ordered_files: list[str] = []
+    diff_by_file: dict[str, list[dict[str, Any]]] = {}
+    context_by_subject: dict[str, list[dict[str, Any]]] = {}
+
+    for block in diff_blocks:
+        file_path = str(block.get("file", "")).strip()
+        if not file_path:
+            continue
+        if file_path not in diff_by_file:
+            ordered_files.append(file_path)
+            diff_by_file[file_path] = []
+        diff_by_file[file_path].append(block)
+
+    for item in extra_context_blocks:
+        file_path = str(item.get("file", "")).strip()
+        subject_file = str(item.get("subject_file", "")).strip() or file_path
+        if not subject_file or not file_path:
+            continue
+        context_by_subject.setdefault(subject_file, []).append(item)
+        if subject_file not in diff_by_file and subject_file not in ordered_files:
+            ordered_files.append(subject_file)
+
+    return ordered_files, diff_by_file, context_by_subject
+
+
 def build_diff_review_prompt(
     *,
     repo_name: str,
@@ -122,23 +151,6 @@ def build_diff_review_prompt(
     static_findings = static_findings or []
     extra_context_blocks = extra_context_blocks or []
 
-    diff_text_parts: list[str] = []
-    for block in diff_blocks:
-        file = str(block.get("file", "")).strip()
-        language = str(block.get("language", "")).strip()
-        patch = str(block.get("patch", "")).rstrip()
-
-        if not file or not patch:
-            continue
-
-        section = [f"### File: {file}"]
-        if language:
-            section.append(f"Language: {language}")
-        section.append("```diff")
-        section.append(patch)
-        section.append("```")
-        diff_text_parts.append("\n".join(section))
-
     static_text_parts: list[str] = []
     for item in static_findings:
         file = item.get("file")
@@ -151,22 +163,50 @@ def build_diff_review_prompt(
             f"- {file}:{line} [{severity}] {tool} / {rule_id} / {message}"
         )
 
-    context_text_parts: list[str] = []
-    for item in extra_context_blocks:
-        file = str(item.get("file", "")).strip()
-        kind = str(item.get("kind", "")).strip()
-        content = str(item.get("content", "")).rstrip()
-
-        if not file or not content:
+    ordered_files, diff_by_file, context_by_subject = _group_blocks_by_subject(diff_blocks, extra_context_blocks)
+    review_units: list[str] = []
+    for file in ordered_files:
+        file_diff_blocks = diff_by_file.get(file, [])
+        file_context_blocks = context_by_subject.get(file, [])
+        if not file_diff_blocks and not file_context_blocks:
             continue
 
-        section = [f"### Context File: {file}"]
-        if kind:
-            section.append(f"Context Type: {kind}")
-        section.append("```")
-        section.append(content)
-        section.append("```")
-        context_text_parts.append("\n".join(section))
+        section = [f"## Review File: {file}"]
+        if file_diff_blocks:
+            first = file_diff_blocks[0]
+            status = str(first.get("status", "")).strip()
+            old_path = str(first.get("old_path", "")).strip()
+            language = str(first.get("language", "")).strip()
+            if status:
+                section.append(f"Status: {status}")
+            if old_path and old_path != file:
+                section.append(f"Old Path: {old_path}")
+            if language:
+                section.append(f"Language: {language}")
+            for index, block in enumerate(file_diff_blocks, start=1):
+                patch = str(block.get("patch", "")).rstrip()
+                if not patch:
+                    continue
+                section.append(f"### Diff Block {index}")
+                section.append("```diff")
+                section.append(patch)
+                section.append("```")
+        if file_context_blocks:
+            section.append("### Related Context")
+            for item in file_context_blocks:
+                source_file = str(item.get("file", "")).strip()
+                kind = str(item.get("kind", "")).strip()
+                content = str(item.get("content", "")).rstrip()
+                if not source_file or not content:
+                    continue
+                header = f"#### {kind or 'context'}"
+                if source_file != file:
+                    header += f" ({source_file})"
+                section.append(header)
+                section.append("```")
+                section.append(content)
+                section.append("```")
+        review_units.append("\n".join(section))
 
     prompt = f"""[TASK]
 请对以下代码变更做“语义审查”，你的目标不是穷举所有潜在问题，而是输出“最值得工程师采取行动的问题”。
@@ -206,11 +246,8 @@ changed_files_count: {len(changed_files)}
 - 不要重复纯规则问题
 - 如果静态扫描结果与语义风险直接相关，可以引用并补充其行为后果
 
-[DIFF]
-{"无" if not diff_text_parts else chr(10).join(diff_text_parts)}
-
-[EXTRA_CONTEXT]
-{"无" if not context_text_parts else chr(10).join(context_text_parts)}
+[DIFF_AND_CONTEXT_BY_FILE]
+{"无" if not review_units else chr(10).join(review_units)}
 
 [DECISION_RULES]
 你必须站在“代码审查决策”的角度输出问题：
@@ -232,6 +269,9 @@ review_action 定义：
 - 每个 finding 必须提供至少 1 条 evidence
 - 只保留值得工程师采取行动的问题
 - 如果没有发现高价值问题，返回 findings: []
+- 对于 rename / move / partial refactor 类 patch，不能仅凭“某段旧代码被删掉了”就断言行为回归；必须结合新代码、调用方上下文或迁移后的实现一起判断
+- 如果提供的调用点上下文已经显示调用方保证了某个前置条件，不要把“被调函数内部少了一层同类保护”直接判成 high 或 block，除非你还能指出该函数在提供的上下文里存在其他未受保护入口
+- 如果某个 helper / 类型 / 处理逻辑只是从当前文件迁移出去，而不是明确消失，不要把它写成行为回归
 
 [OUTPUT_SCHEMA]
 {OUTPUT_SCHEMA_TEXT}

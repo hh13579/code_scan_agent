@@ -19,6 +19,7 @@ from code_scan_agent.nodes.llm_triage import llm_triage
 from code_scan_agent.nodes.merge_review_findings import merge_review_findings
 from code_scan_agent.nodes.normalize_findings import normalize_findings
 from code_scan_agent.nodes.review_diff_with_llm import review_diff_with_llm
+from code_scan_agent.nodes.select_review_context import select_review_context
 from code_scan_agent.nodes.run_cpp_scanners import run_cpp_scanners
 from code_scan_agent.nodes.run_java_scanners import run_java_scanners
 from code_scan_agent.nodes.run_security_scanners import run_security_scanners
@@ -81,6 +82,7 @@ def build_graph():
     graph.add_node("run_security_scanners", run_security_scanners)
     graph.add_node("normalize_findings", normalize_findings)
     graph.add_node("llm_triage", llm_triage)
+    graph.add_node("select_review_context", select_review_context)
     graph.add_node("review_diff_with_llm", review_diff_with_llm)
     graph.add_node("merge_review_findings", merge_review_findings)
     graph.add_node("build_report", build_report)
@@ -152,7 +154,8 @@ def build_graph():
     )
 
     graph.add_edge("normalize_findings", "llm_triage")
-    graph.add_edge("llm_triage", "review_diff_with_llm")
+    graph.add_edge("llm_triage", "select_review_context")
+    graph.add_edge("select_review_context", "review_diff_with_llm")
     graph.add_edge("review_diff_with_llm", "merge_review_findings")
     graph.add_edge("merge_review_findings", "build_report")
     graph.add_edge("build_report", "finalize")
@@ -182,6 +185,7 @@ class _FallbackGraph:
 
         state = normalize_findings(state)
         state = llm_triage(state)
+        state = select_review_context(state)
         state = review_diff_with_llm(state)
         state = merge_review_findings(state)
         state = build_report(state)

@@ -11,6 +11,7 @@ ReviewAction = Literal["block", "should_fix", "follow_up"]
 
 class ScanRequest(TypedDict, total=False):
     repo_path: str
+    source_repo_path: str
     mode: ScanMode
     enable_security_scan: bool
     enable_fix_suggestion: bool
