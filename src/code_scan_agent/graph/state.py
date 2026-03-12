@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Literal, TypedDict
 
+from code_scan_agent.retrieval.specs import ContextBlock, RetrievalPlan
+
 
 Language = Literal["cpp", "java", "ts"]
 ScanMode = Literal["full", "diff", "selected"]
@@ -71,6 +73,7 @@ class Finding(TypedDict, total=False):
     source: str
     rule_id: str
     category: str
+    bug_class: str
     severity: Severity
     file: str
     line: int | None
@@ -84,8 +87,13 @@ class Finding(TypedDict, total=False):
     autofix_available: bool
     in_diff: bool
     evidence: list[str] | str
+    key_evidence_roles: list[str]
+    evidence_completeness: str
+    key_evidence_summary: list[str]
     suggested_action: str
     overlaps_static: bool
+    verification_status: str
+    verification_notes: list[str] | str
 
 
 class Report(TypedDict, total=False):
@@ -110,7 +118,8 @@ class GraphState(TypedDict, total=False):
     llm_review_findings: list[Finding]
     static_findings: list[Finding]
     merged_findings: list[Finding]
-    review_context_blocks: list[dict[str, Any]]
+    review_plans: list[RetrievalPlan]
+    review_context_blocks: list[ContextBlock]
 
     # 输出
     report: Report

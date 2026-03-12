@@ -12,6 +12,11 @@ _REVIEW_ACTION_ZH = {
     "should_fix": "建议本次修复",
     "follow_up": "建议后续跟进",
 }
+_VERIFICATION_STATUS_ZH = {
+    "strengthened": "已增强",
+    "unchanged": "未变化",
+    "weak": "偏弱",
+}
 
 
 def _now_str() -> str:
@@ -44,6 +49,10 @@ def _sev_label(sev: str) -> str:
 
 def _review_action_label(action: str) -> str:
     return _REVIEW_ACTION_ZH.get((action or "").strip(), action or "未说明")
+
+
+def _verification_status_label(status: str) -> str:
+    return _VERIFICATION_STATUS_ZH.get((status or "").strip(), status or "未校验")
 
 
 def _status_from_summary(summary: dict[str, Any]) -> str:
@@ -262,6 +271,7 @@ def _render_one_finding(
     message = _truncate(str(f.get("message", "")), 180 if not compact else 140)
     impact = _truncate(str(f.get("impact", "")), 180 if not compact else 140)
     review_action = str(f.get("review_action", "")).strip()
+    verification_status = str(f.get("verification_status", "")).strip()
     suggested_action = _truncate(str(f.get("suggested_action", "")), 160 if not compact else 120)
 
     loc = file
@@ -288,6 +298,8 @@ def _render_one_finding(
         meta_parts.append(f"置信度：`{confidence}`")
     if review_action:
         meta_parts.append(f"建议动作：**{_review_action_label(review_action)}**")
+    if verification_status:
+        meta_parts.append(f"校验：`{_verification_status_label(verification_status)}`")
 
     out = [header]
     if meta_parts:
@@ -312,5 +324,14 @@ def _render_one_finding(
         out.append("   - 证据：")
         for ev in shown:
             out.append(f"     - {ev}")
+
+    verification_notes = f.get("verification_notes", [])
+    if isinstance(verification_notes, str):
+        verification_notes = [verification_notes] if verification_notes.strip() else []
+    shown_notes = [str(x).strip() for x in verification_notes if str(x).strip()][:3]
+    if shown_notes:
+        out.append("   - 校验说明：")
+        for note in shown_notes:
+            out.append(f"     - {note}")
 
     return out

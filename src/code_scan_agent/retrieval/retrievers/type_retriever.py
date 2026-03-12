@@ -73,7 +73,7 @@ def _candidate_symbols(patch: str, function_context: dict[str, Any] | None) -> l
     return candidates
 
 
-def retrieve_type_definitions(
+def get_related_types(
     *,
     repo_path: str | Path,
     file: str,
@@ -135,3 +135,20 @@ def retrieve_type_definitions(
             break
 
     return out
+
+
+def retrieve_type_definitions(
+    *,
+    repo_path: str | Path,
+    file: str,
+    language: str,
+    patch: str,
+    function_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    return get_related_types(
+        repo_path=repo_path,
+        file=file,
+        language=language,
+        patch=patch,
+        function_context=function_context,
+    )

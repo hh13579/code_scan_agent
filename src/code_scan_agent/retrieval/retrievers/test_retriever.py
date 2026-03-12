@@ -34,7 +34,7 @@ def _candidate_test_names(file: str, language: str) -> list[str]:
     return names
 
 
-def retrieve_related_tests(
+def find_related_tests(
     *,
     repo_path: str | Path,
     file: str,
@@ -106,3 +106,20 @@ def retrieve_related_tests(
             break
 
     return out
+
+
+def retrieve_related_tests(
+    *,
+    repo_path: str | Path,
+    file: str,
+    language: str,
+    patch: str,
+    function_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    return find_related_tests(
+        repo_path=repo_path,
+        file=file,
+        language=language,
+        patch=patch,
+        function_context=function_context,
+    )

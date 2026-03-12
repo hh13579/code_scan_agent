@@ -46,6 +46,13 @@ def render_sarif_report(report: dict[str, Any]) -> dict[str, Any]:
             evidence_text = " | ".join(str(part) for part in evidence if str(part).strip())
         else:
             evidence_text = ""
+        verification_notes = item.get("verification_notes", [])
+        if isinstance(verification_notes, str):
+            verification_notes_text = verification_notes
+        elif isinstance(verification_notes, list):
+            verification_notes_text = " | ".join(str(part) for part in verification_notes if str(part).strip())
+        else:
+            verification_notes_text = ""
         location: dict[str, Any] | None = None
         if file_path:
             location = {
@@ -68,6 +75,8 @@ def render_sarif_report(report: dict[str, Any]) -> dict[str, Any]:
                 "review_action": str(item.get("review_action", "") or ""),
                 "impact": str(item.get("impact", "") or ""),
                 "evidence": evidence_text,
+                "verification_status": str(item.get("verification_status", "") or ""),
+                "verification_notes": verification_notes_text,
                 "suggested_action": str(item.get("suggested_action", "") or ""),
                 "overlaps_static": bool(item.get("overlaps_static", False)),
             },

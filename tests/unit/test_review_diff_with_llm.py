@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from code_scan_agent.nodes.review_diff_with_llm import _select_diff_blocks, review_diff_with_llm
+from code_scan_agent.retrieval.specs import RetrievalHints, RetrievalPlan, RetrievalPlanItem
 
 
 def _base_state(repo_path: Path) -> dict[str, object]:
@@ -64,6 +65,7 @@ class ReviewDiffWithLlmTest(unittest.TestCase):
                     {
                         "file": "src/demo.cpp",
                         "line": 2,
+                        "bug_class": "resource_lifecycle",
                         "severity": "high",
                         "review_action": "block",
                         "category": "memory",
@@ -71,6 +73,8 @@ class ReviewDiffWithLlmTest(unittest.TestCase):
                         "message": "Returned reference may outlive local storage.",
                         "impact": "The caller may observe undefined behavior if it uses invalid storage.",
                         "confidence": "high",
+                        "key_evidence_roles": ["changed_entrypoint", "cleanup_path"],
+                        "evidence_completeness": "strong",
                         "evidence": ["New code introduces a local temporary."],
                         "suggested_action": "Return by value or store data in owned storage.",
                     }
@@ -89,10 +93,13 @@ class ReviewDiffWithLlmTest(unittest.TestCase):
         self.assertEqual(findings[0]["file"], "src/demo.cpp")
         self.assertEqual(findings[0]["rule_id"], "semantic-review")
         self.assertEqual(findings[0]["language"], "cpp")
-        self.assertEqual(findings[0]["category"], "other")
+        self.assertEqual(findings[0]["category"], "resource_lifecycle")
+        self.assertEqual(findings[0]["bug_class"], "resource_lifecycle")
         self.assertEqual(findings[0]["review_action"], "block")
         self.assertEqual(findings[0]["impact"], "The caller may observe undefined behavior if it uses invalid storage.")
         self.assertEqual(findings[0]["evidence"], ["New code introduces a local temporary."])
+        self.assertEqual(findings[0]["key_evidence_roles"], ["changed_entrypoint", "cleanup_path"])
+        self.assertEqual(findings[0]["evidence_completeness"], "strong")
 
     @patch("code_scan_agent.nodes.review_diff_with_llm._call_llm_diff_review")
     def test_dirty_json_falls_back_to_empty_findings(self, mock_call) -> None:
@@ -103,6 +110,39 @@ class ReviewDiffWithLlmTest(unittest.TestCase):
 
         self.assertEqual(result["llm_review_findings"], [])
         self.assertTrue(any("parse failed" in item.lower() for item in result["errors"]))
+
+    @patch("code_scan_agent.nodes.review_diff_with_llm._call_llm_diff_review")
+    def test_resource_categories_are_preserved(self, mock_call) -> None:
+        mock_call.return_value = json.dumps(
+            {
+                "summary": {"overall_risk": "medium"},
+                "findings": [
+                    {
+                        "file": "src/demo.cpp",
+                        "line": 2,
+                        "severity": "medium",
+                        "review_action": "should_fix",
+                        "category": "ownership_mismatch",
+                        "title": "Ownership chain is broken",
+                        "message": "The new bridge does not preserve the cleanup path.",
+                        "impact": "Deep fields may leak on every request.",
+                        "confidence": "high",
+                        "evidence": [
+                            "Allocation enters the new wrapper path.",
+                            "The cleanup chain is not visible in the new API.",
+                        ],
+                        "suggested_action": "Route the new path through the existing pool/release mechanism.",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+        state = _base_state(self.repo_path)
+
+        result = review_diff_with_llm(state)  # type: ignore[arg-type]
+
+        self.assertEqual(result["llm_review_findings"][0]["category"], "ownership_mismatch")
+        self.assertEqual(result["llm_review_findings"][0]["bug_class"], "ownership_mismatch")
 
     @patch("code_scan_agent.nodes.review_diff_with_llm._call_llm_diff_review")
     def test_finding_without_evidence_or_impact_is_degraded(self, mock_call) -> None:
@@ -136,6 +176,166 @@ class ReviewDiffWithLlmTest(unittest.TestCase):
         self.assertEqual(finding["impact"], "该改动可能影响局部行为正确性，建议在相关路径上补充验证。")
         self.assertEqual(finding["evidence"], [])
         self.assertTrue(any("dropped=0" in item for item in result["logs"]))
+        self.assertEqual(finding["evidence_completeness"], "partial")
+
+    @patch("code_scan_agent.nodes.review_diff_with_llm._call_llm_diff_review")
+    def test_route_code_section_leak_is_synthesized_from_context_chain(self, mock_call) -> None:
+        mock_call.return_value = json.dumps({"summary": {"overall_risk": "low"}, "findings": []}, ensure_ascii=False)
+
+        repo_path = self.repo_path
+        (repo_path / "nav_wrapper" / "rg_tools").mkdir(parents=True)
+        (repo_path / "nav_wrapper" / "rg_tools" / "rg_api_tools.cpp").write_text(
+            "void AddRouteCodeSection() {\n"
+            "    PtrArr<RGEvent_t> events(rg_info.event());\n"
+            "    RG_SetCodeSection(handle, routeId, tag, endPoint, events.cnt, events);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        state = {
+            "request": {"repo_path": str(repo_path), "mode": "diff"},
+            "repo_profile": {"repo_path": str(repo_path), "languages": ["cpp"]},
+            "diff_files": [
+                {
+                    "path": "nav_wrapper/rg_tools/rg_api_tools.cpp",
+                    "language": "cpp",
+                    "status": "M",
+                    "changed_lines": [1, 2, 3],
+                    "patch": (
+                        "diff --git a/nav_wrapper/rg_tools/rg_api_tools.cpp b/nav_wrapper/rg_tools/rg_api_tools.cpp\n"
+                        "@@ -0,0 +1,4 @@\n"
+                        "+void AddRouteCodeSection() {\n"
+                        "+    PtrArr<RGEvent_t> events(rg_info.event());\n"
+                        "+    RG_SetCodeSection(handle, routeId, tag, endPoint, events.cnt, events);\n"
+                        "+}\n"
+                    ),
+                    "hunks": [
+                        "@@ -0,0 +1,4 @@\n"
+                        "+void AddRouteCodeSection() {\n"
+                        "+    PtrArr<RGEvent_t> events(rg_info.event());\n"
+                        "+    RG_SetCodeSection(handle, routeId, tag, endPoint, events.cnt, events);\n"
+                        "+}\n"
+                    ],
+                }
+            ],
+            "review_context_blocks": [
+                {
+                    "file": "src/navi_guide.cpp",
+                    "subject_file": "nav_wrapper/rg_tools/rg_api_tools.cpp",
+                    "kind": "ownership_path",
+                    "evidence_role": "ownership_transfer_path",
+                    "symbol": "RG_SetCodeSection",
+                    "content": "int RG_SetCodeSection(...) {\n    return mgr->setCodeSection(routeId, tag, endPoint, eventsCnt, events);\n}\n",
+                },
+                {
+                    "file": "src/navi_guide.cpp",
+                    "subject_file": "nav_wrapper/rg_tools/rg_api_tools.cpp",
+                    "kind": "sibling_api",
+                    "evidence_role": "sibling_baseline",
+                    "symbol": "RG_SetMarkers",
+                    "content": "int RG_SetMarkers(...) {\n    if (mgr->saveEventsAllocPointerToPool(routeId, eventCnt, events) != NG_RET_OK) {\n        mgr->releaseEventsAllocPointer(eventCnt, (RGEvent_t*)events);\n    }\n}\n",
+                },
+                {
+                    "file": "nav_wrapper/rg_tools/pb2c.h",
+                    "subject_file": "nav_wrapper/rg_tools/rg_api_tools.cpp",
+                    "kind": "helper_definition",
+                    "evidence_role": "helper_definition",
+                    "symbol": "pb2c",
+                    "content": "static void pb2c(RGVISentence_t& dst, const VISentence& src) {\n    dst.ttsContent = new ng_wchar[ttsLen+1];\n}\n\nstatic void pb2c(RGBIMission_t &dst, const BIMission &src) {\n    dst.missionDisplayPb = new ng_char[dst.missionDisplayPbSize];\n}\n\ntemplate <typename T> class PtrArr{\npublic:\n    ~PtrArr(){if(m_p){delete[] m_p;}}\n};\n",
+                },
+                {
+                    "file": "dd_src/dd_route_guide/dd_ng_route_guide_mgr.cpp",
+                    "subject_file": "nav_wrapper/rg_tools/rg_api_tools.cpp",
+                    "kind": "cleanup_path",
+                    "evidence_role": "cleanup_path",
+                    "content": "int DDRouteGuideMgr::saveEventsAllocPointerToPool(...) {\n    return m_vectRG[i]->saveEventsAllocPointerToPool(eventCnt, events);\n}\n\nvoid DDRouteGuideMgr::releaseEventsAllocPointer(...) {\n    SAFE_DELETE_ARRAY(event.viInfo.sentences[j].ttsContent);\n}\n",
+                },
+                {
+                    "file": "dd_src/dd_route_guide/dd_data_mgr/dd_rg_data_mgr.cpp",
+                    "subject_file": "nav_wrapper/rg_tools/rg_api_tools.cpp",
+                    "kind": "cleanup_path",
+                    "evidence_role": "cleanup_path",
+                    "content": "void DDRGDataMgr::clearEventsAllocPointerPool() {\n    SAFE_DELETE_ARRAY(pMissionPb);\n}\n\nvoid DDRGDataMgr::saveEventsAllocPointerToPool(...) {\n    m_setMissionPBPointerPool.insert(event.biInfo.infoMission.missionDisplayPb);\n    m_setTTSPointerPool.insert(event.viInfo.sentences[j].ttsContent);\n}\n",
+                },
+            ],
+            "review_plans": [
+                RetrievalPlan(
+                    file="nav_wrapper/rg_tools/rg_api_tools.cpp",
+                    language="cpp",
+                    suspected_bug_classes=("resource_lifecycle", "ownership_mismatch"),
+                    class_reasons={
+                        "resource_lifecycle": ("signal:helper_alloc_like", "signal:cleanup_terms"),
+                        "ownership_mismatch": ("signal:wrapper_or_bridge",),
+                    },
+                    retrieval_hints={
+                        "resource_lifecycle": RetrievalHints(
+                            symbol_candidates=("AddRouteCodeSection", "RG_SetCodeSection", "PtrArr", "pb2c"),
+                            cleanup_terms=("save", "release", "pool", "clear"),
+                        ),
+                        "ownership_mismatch": RetrievalHints(
+                            symbol_candidates=("AddRouteCodeSection", "RG_SetCodeSection"),
+                            api_families=("RG_Set",),
+                        ),
+                    },
+                    items=(
+                        RetrievalPlanItem(
+                            bug_class="resource_lifecycle",
+                            evidence_role="changed_entrypoint",
+                            hop=1,
+                            why_selected="changed bridge path",
+                            hints=RetrievalHints(symbol_candidates=("AddRouteCodeSection",)),
+                        ),
+                        RetrievalPlanItem(
+                            bug_class="resource_lifecycle",
+                            evidence_role="helper_definition",
+                            hop=2,
+                            why_selected="helper may allocate deep fields",
+                            hints=RetrievalHints(symbol_candidates=("pb2c",), cleanup_terms=("save", "release")),
+                        ),
+                        RetrievalPlanItem(
+                            bug_class="ownership_mismatch",
+                            evidence_role="ownership_transfer_path",
+                            hop=3,
+                            why_selected="need ownership handoff path",
+                            hints=RetrievalHints(symbol_candidates=("RG_SetCodeSection",), cleanup_terms=("save", "release", "pool", "clear")),
+                        ),
+                        RetrievalPlanItem(
+                            bug_class="ownership_mismatch",
+                            evidence_role="cleanup_path",
+                            hop=3,
+                            why_selected="need cleanup path",
+                            hints=RetrievalHints(symbol_candidates=("saveEventsAllocPointerToPool",), cleanup_terms=("save", "release", "pool", "clear")),
+                        ),
+                        RetrievalPlanItem(
+                            bug_class="ownership_mismatch",
+                            evidence_role="sibling_baseline",
+                            hop=3,
+                            why_selected="need sibling baseline",
+                            hints=RetrievalHints(symbol_candidates=("RG_SetMarkers",), api_families=("RG_Set",)),
+                        ),
+                    ),
+                    hop_strategy=("hop1", "hop2", "hop3"),
+                    why_selected=("resource lifecycle suspected", "ownership mismatch suspected"),
+                )
+            ],
+            "triaged_findings": [],
+            "logs": [],
+            "errors": [],
+        }
+
+        result = review_diff_with_llm(state)  # type: ignore[arg-type]
+
+        findings = result["llm_review_findings"]
+        self.assertEqual(len(findings), 1)
+        finding = findings[0]
+        self.assertEqual(finding["category"], "ownership_mismatch")
+        self.assertEqual(finding["severity"], "medium")
+        self.assertEqual(finding["review_action"], "should_fix")
+        joined = "\n".join(finding["evidence"])
+        self.assertIn("AddRouteCodeSection", joined)
+        self.assertIn("RG_SetMarkers", joined)
+        self.assertIn("saveEventsAllocPointerToPool", joined)
+        self.assertIn("missionDisplayPb", joined)
+        self.assertIn("ttsContent", joined)
 
     @patch("code_scan_agent.nodes.review_diff_with_llm._call_llm_diff_review")
     def test_move_like_diff_with_guarded_call_is_downgraded(self, mock_call) -> None:

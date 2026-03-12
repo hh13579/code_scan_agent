@@ -400,6 +400,8 @@ def build_payload(
                 "confidence": str(finding.get("confidence", "")),
                 "review_action": str(finding.get("review_action", "")),
                 "evidence": finding.get("evidence", []),
+                "verification_status": str(finding.get("verification_status", "")),
+                "verification_notes": finding.get("verification_notes", []),
                 "suggested_action": str(finding.get("suggested_action", "")),
                 "in_diff": bool(finding.get("in_diff", False)),
                 "code_context": _read_code_context(repo_path, rel_file, line_number, context_lines, git_ref=head_ref),
@@ -521,6 +523,8 @@ def _build_cn_findings(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "fix_advice": fix_advice,
                 "review_action": review_action,
                 "evidence": evidence,
+                "verification_status": str(item.get("verification_status", "")),
+                "verification_notes": item.get("verification_notes", []),
             }
         )
     return findings
@@ -541,6 +545,7 @@ def _build_summary_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "judgement": item.get("judgement", ""),
                 "impact": item.get("impact", ""),
                 "review_action": item.get("review_action", ""),
+                "verification_status": item.get("verification_status", ""),
                 "evidence": item.get("evidence", []),
             }
         )
@@ -707,10 +712,12 @@ def render_markdown(analysis: dict[str, Any], payload: dict[str, Any], generated
                     f"- 判断：{item.get('judgement', '')}",
                     f"- 置信度：{item.get('confidence', '')}",
                     f"- 审查动作：{item.get('review_action', '') or '无'}",
+                    f"- 校验状态：{item.get('verification_status', '') or '未校验'}",
                     f"- 原因：{item.get('why', '')}",
                     f"- 影响：{item.get('impact', '')}",
                     f"- 建议：{item.get('fix_advice', '')}",
                     f"- 证据：{'；'.join(item.get('evidence', [])) if item.get('evidence') else '无'}",
+                    f"- 校验说明：{'；'.join(item.get('verification_notes', [])) if item.get('verification_notes') else '无'}",
                     "",
                 ]
             )

@@ -20,6 +20,18 @@ _REVIEW_ACTION_ORDER = {
     "follow_up": 2,
     "": 3,
 }
+_VERIFICATION_ORDER = {
+    "strengthened": 0,
+    "unchanged": 1,
+    "weak": 2,
+    "": 3,
+}
+_EVIDENCE_COMPLETENESS_ORDER = {
+    "complete": 0,
+    "strong": 1,
+    "partial": 2,
+    "": 3,
+}
 
 
 def _safe_findings(value: Any) -> list[dict[str, Any]]:
@@ -47,6 +59,29 @@ def _group_by_severity(findings: list[dict[str, Any]]) -> dict[str, list[dict[st
     for f in findings:
         grouped[_severity_of(f)].append(f)
     return {sev: grouped.get(sev, []) for sev in _SEVERITIES}
+
+
+def _bug_class_of(f: dict[str, Any]) -> str:
+    bug_class = str(f.get("bug_class", "")).strip().lower()
+    if bug_class:
+        return bug_class
+    return str(f.get("category", "other")).strip().lower() or "other"
+
+
+def _build_bug_class_summary(findings: list[dict[str, Any]]) -> dict[str, int]:
+    grouped: dict[str, int] = {}
+    for finding in findings:
+        bug_class = _bug_class_of(finding)
+        grouped[bug_class] = grouped.get(bug_class, 0) + 1
+    return dict(sorted(grouped.items(), key=lambda item: (-item[1], item[0])))
+
+
+def _build_evidence_completeness_summary(findings: list[dict[str, Any]]) -> dict[str, int]:
+    grouped = {"complete": 0, "strong": 0, "partial": 0, "": 0}
+    for finding in findings:
+        key = str(finding.get("evidence_completeness", "")).strip().lower()
+        grouped[key if key in grouped else ""] += 1
+    return grouped
 
 
 def _build_summary(findings: list[dict[str, Any]]) -> dict[str, int]:
@@ -102,10 +137,13 @@ def _top_issue_sort_key(f: dict[str, Any]):
     """
     review_action = str(f.get("review_action", "")).strip().lower()
     severity = _severity_of(f)
+    verification_status = str(f.get("verification_status", "")).strip().lower()
 
     return (
         _REVIEW_ACTION_ORDER.get(review_action, 99),
         _SEV_ORDER.get(severity, 99),
+        _VERIFICATION_ORDER.get(verification_status, 99),
+        _EVIDENCE_COMPLETENESS_ORDER.get(str(f.get("evidence_completeness", "")).strip().lower(), 99),
         0 if _is_llm_review_finding(f) else 1,
         0 if _has_impact(f) else 1,
         0 if _has_evidence(f) else 1,
@@ -199,6 +237,8 @@ def build_report(state: GraphState) -> GraphState:
     merged_summary = _build_summary(display_findings)
     static_summary = _build_summary(static_findings)
     llm_review_summary = _build_summary(llm_review_findings)
+    bug_class_summary = _build_bug_class_summary(display_findings)
+    evidence_completeness_summary = _build_evidence_completeness_summary(display_findings)
 
     top_issues = _build_top_issues(display_findings, max_items=5)
 
@@ -208,6 +248,8 @@ def build_report(state: GraphState) -> GraphState:
         "findings": display_findings,
         "grouped_by_file": grouped_by_file,
         "grouped_by_severity": grouped_by_severity,
+        "bug_class_summary": bug_class_summary,
+        "evidence_completeness_summary": evidence_completeness_summary,
 
         # 新增：首页摘要可直接消费
         "top_issues": top_issues,

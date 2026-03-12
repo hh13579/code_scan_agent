@@ -9,6 +9,8 @@ from typing import Any
 
 from code_scan_agent.graph.state import Finding, GraphState
 from code_scan_agent.prompts.diff_review_prompt import build_diff_review_messages
+from code_scan_agent.retrieval.language.common import guess_symbols_from_patch
+from code_scan_agent.retrieval.specs import BUG_CLASS_SPECS
 from code_scan_agent.tools.deepseek_cn_report import _call_deepseek_with_retry
 
 
@@ -24,8 +26,25 @@ _ALLOWED_CATEGORIES = {
     "concurrency",
     "config_behavior_change",
     "partial_refactor",
+    "resource_lifecycle",
+    "ownership_mismatch",
+    "deep_free_missing",
+    "wrapper_bypasses_existing_cleanup",
+    "stale_state",
+    "contract_drift",
+    "partial_init_outward_struct",
+    "semantic_misuse",
+    "sibling_api_asymmetry",
+    "error_path_cleanup_missing",
     "other",
 }
+_RESOURCE_CATEGORIES = {
+    "resource_lifecycle",
+    "ownership_mismatch",
+    "deep_free_missing",
+    "wrapper_bypasses_existing_cleanup",
+}
+_ALLOWED_EVIDENCE_COMPLETENESS = {"partial", "strong", "complete"}
 
 
 def _append_error(state: GraphState, message: str) -> None:
@@ -34,6 +53,12 @@ def _append_error(state: GraphState, message: str) -> None:
         bucket = []
         state["errors"] = bucket
     bucket.append(message)
+
+
+def _item_value(item: Any, name: str, default: Any = "") -> Any:
+    if isinstance(item, dict):
+        return item.get(name, default)
+    return getattr(item, name, default)
 
 
 def _get_int_env(name: str, default: int, min_value: int = 0) -> int:
@@ -281,8 +306,17 @@ def _norm_confidence(value: Any, severity: str) -> str:
 
 
 def _norm_category(value: Any) -> str:
-    category = _norm_str(value)
+    category = _norm_str(value).lower()
     if category in _ALLOWED_CATEGORIES:
+        return category
+    return "other"
+
+
+def _norm_bug_class(value: Any, category: str) -> str:
+    bug_class = _norm_str(value).lower()
+    if bug_class in BUG_CLASS_SPECS:
+        return bug_class
+    if category in BUG_CLASS_SPECS:
         return category
     return "other"
 
@@ -306,6 +340,52 @@ def _normalize_evidence(value: Any) -> list[str]:
         return out[:5]
     text = _norm_str(value)
     return [text] if text else []
+
+
+def _normalize_role_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, tuple):
+        items = list(value)
+    else:
+        items = [_norm_str(value)] if _norm_str(value) else []
+    ordered: list[str] = []
+    for item in items:
+        normalized = _norm_str(item)
+        if normalized and normalized not in ordered:
+            ordered.append(normalized)
+    return ordered[:6]
+
+
+def _infer_evidence_completeness(
+    bug_class: str,
+    key_evidence_roles: list[str],
+    evidence: list[str],
+) -> str:
+    spec = BUG_CLASS_SPECS.get(bug_class)
+    if spec is None:
+        return "strong" if len(evidence) >= 2 else "partial"
+
+    satisfied = 0
+    for group in spec.minimum_evidence_requirements:
+        if any(role in key_evidence_roles for role in group):
+            satisfied += 1
+    if satisfied == len(spec.minimum_evidence_requirements) and len(evidence) >= 2:
+        return "complete"
+    if satisfied >= max(1, len(spec.minimum_evidence_requirements) - 1) and evidence:
+        return "strong"
+    return "partial"
+
+
+def _norm_evidence_completeness(value: Any, *, bug_class: str, key_evidence_roles: list[str], evidence: list[str]) -> str:
+    completeness = _norm_str(value).lower()
+    if completeness in _ALLOWED_EVIDENCE_COMPLETENESS:
+        return completeness
+    return _infer_evidence_completeness(bug_class, key_evidence_roles, evidence)
+
+
+def _summarize_key_evidence(evidence: list[str]) -> list[str]:
+    return [item for item in evidence[:3] if item]
 
 
 def _finding_text(finding: dict[str, Any]) -> str:
@@ -404,16 +484,34 @@ def _repo_contains_identifier(
 
 
 def _related_context_blocks(
-    review_context_blocks: list[dict[str, Any]],
+    review_context_blocks: list[Any],
     *,
     file_path: str,
-) -> list[dict[str, Any]]:
-    related: list[dict[str, Any]] = []
+) -> list[Any]:
+    related: list[Any] = []
     for item in review_context_blocks:
-        subject_file = str(item.get("subject_file", "")).strip() or str(item.get("file", "")).strip()
+        subject_file = str(_item_value(item, "subject_file", "")).strip() or str(_item_value(item, "file", "")).strip()
         if subject_file == file_path:
             related.append(item)
     return related
+
+
+def _is_resource_finding(finding: Finding) -> bool:
+    category = str(finding.get("category", "")).strip().lower()
+    if category in _RESOURCE_CATEGORIES:
+        return True
+    lowered = _finding_text(finding).lower()
+    markers = (
+        "memory leak",
+        "resource leak",
+        "ownership",
+        "saveeventsallocpointertopool",
+        "missiondisplaypb",
+        "ttscontent",
+        "ptrarr",
+        "cleareventsallocpointerpool",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 def _has_guarded_call_context(finding: Finding, related_context_blocks: list[dict[str, Any]]) -> bool:
@@ -427,9 +525,9 @@ def _has_guarded_call_context(finding: Finding, related_context_blocks: list[dic
         return False
 
     for block in related_context_blocks:
-        if str(block.get("kind", "")) != "call_site":
+        if str(_item_value(block, "kind", "")) != "call_site":
             continue
-        content = str(block.get("content", ""))
+        content = str(_item_value(block, "content", ""))
         content_lower = content.lower()
         if "empty()" not in content_lower or "return" not in content_lower:
             continue
@@ -443,7 +541,7 @@ def _has_relocation_signal(
     *,
     file_path: str,
     diff_file_map: dict[str, dict[str, Any]],
-    review_context_blocks: list[dict[str, Any]],
+    review_context_blocks: list[Any],
 ) -> bool:
     finding_text = _finding_text(finding)
     identifiers = _candidate_identifiers(finding_text)
@@ -451,11 +549,11 @@ def _has_relocation_signal(
         return False
 
     for item in review_context_blocks:
-        subject_file = str(item.get("subject_file", "")).strip() or str(item.get("file", "")).strip()
-        source_file = str(item.get("file", "")).strip()
+        subject_file = str(_item_value(item, "subject_file", "")).strip() or str(_item_value(item, "file", "")).strip()
+        source_file = str(_item_value(item, "file", "")).strip()
         if subject_file == file_path:
             continue
-        content = str(item.get("content", ""))
+        content = str(_item_value(item, "content", ""))
         if any(identifier in content or identifier in source_file for identifier in identifiers):
             return True
 
@@ -532,13 +630,16 @@ def _stabilize_llm_finding(
     repo_root: Path,
     diff_item: dict[str, Any] | None,
     diff_file_map: dict[str, dict[str, Any]],
-    review_context_blocks: list[dict[str, Any]],
+    review_context_blocks: list[Any],
     repo_symbol_cache: dict[str, bool],
 ) -> Finding:
     file_path = str(finding.get("file", "")).strip()
     status = str((diff_item or {}).get("status", "")).strip().upper()
     evidence = _normalize_evidence(finding.get("evidence"))
     related_context = _related_context_blocks(review_context_blocks, file_path=file_path)
+
+    if _is_resource_finding(finding):
+        return finding
 
     if (
         _is_move_like_status(status)
@@ -569,8 +670,8 @@ def _stabilize_llm_finding(
         and _is_diff_only_evidence(evidence)
         and _is_speculative_callsite_gap(finding)
     ):
-        call_site_blocks = [item for item in related_context if str(item.get("kind", "")) == "call_site"]
-        if not call_site_blocks or all(str(item.get("file", "")).strip() == file_path for item in call_site_blocks):
+        call_site_blocks = [item for item in related_context if str(_item_value(item, "kind", "")) == "call_site"]
+        if not call_site_blocks or all(str(_item_value(item, "file", "")).strip() == file_path for item in call_site_blocks):
             return _downgrade_finding(
                 finding,
                 message="当前只看到签名或局部调用改动，没有拿到未同步调用方的直接证据，这更像一次需要补充核对的兼容性提醒。",
@@ -615,6 +716,337 @@ def _stabilize_llm_finding(
     return finding
 
 
+def _context_text_for_blocks(
+    blocks: list[Any],
+    *,
+    file_suffix: str | None = None,
+    kind: str | None = None,
+) -> str:
+    parts: list[str] = []
+    for block in blocks:
+        block_file = str(_item_value(block, "file", "")).strip()
+        block_kind = str(_item_value(block, "kind", "")).strip()
+        if file_suffix and not block_file.endswith(file_suffix):
+            continue
+        if kind and block_kind != kind:
+            continue
+        content = str(_item_value(block, "content", "")).strip()
+        if content:
+            parts.append(content)
+    return "\n\n".join(parts)
+
+
+def _find_line_in_repo(repo_root: Path, rel_file: str, needle: str) -> int | None:
+    try:
+        lines = (repo_root / rel_file).read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return None
+    for index, line in enumerate(lines, start=1):
+        if needle in line:
+            return index
+    return None
+
+
+_ALLOC_OR_HELPER_RE = re.compile(
+    r"\b(new(?:\[\])?|malloc|calloc|realloc|strdup|pb2c|parse|decode|clone|create|alloc|acquire|retain)\b",
+    re.IGNORECASE,
+)
+_CLEANUP_RE = re.compile(
+    r"\b((?:save|release|pool|clear|destroy|reset|cleanup|free|delete|close)[A-Za-z0-9_]*)\b",
+    re.IGNORECASE,
+)
+_OUTER_ONLY_FREE_RE = re.compile(
+    r"delete\[\]\s+[A-Za-z_][A-Za-z0-9_]*",
+    re.IGNORECASE,
+)
+_DEEP_FIELD_ALLOC_RE = re.compile(
+    r"\.[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:new(?:\[\])?|malloc|calloc|realloc|strdup)",
+    re.IGNORECASE,
+)
+_WRAPPER_OWNERSHIP_RE = re.compile(
+    r"\b(PtrArr|vector<|std::vector|unique_ptr|shared_ptr|bridge|wrapper|manager|set[A-Z][A-Za-z_]+|[A-Z]+_Set[A-Za-z_]+)\b",
+    re.IGNORECASE,
+)
+_ROLE_KIND_FALLBACK = {
+    "changed_entrypoint": {"function_context"},
+    "local_changed_logic": {"function_context"},
+    "helper_definition": {"helper_definition"},
+    "ownership_transfer_path": {"ownership_path"},
+    "cleanup_path": {"cleanup_path"},
+    "destructor_or_clear": {"cleanup_path"},
+    "sibling_baseline": {"sibling_api"},
+}
+
+
+def _block_role_texts(
+    related_blocks: list[Any],
+    role: str,
+) -> list[str]:
+    texts: list[str] = []
+    for block in related_blocks:
+        evidence_role = str(_item_value(block, "evidence_role", "")).strip()
+        kind = str(_item_value(block, "kind", "")).strip()
+        if evidence_role != role and kind not in _ROLE_KIND_FALLBACK.get(role, set()):
+            continue
+        content = str(_item_value(block, "content", "")).strip()
+        if content:
+            texts.append(content)
+    return texts
+
+
+def _first_symbol_for_role(related_blocks: list[Any], role: str) -> str:
+    for block in related_blocks:
+        evidence_role = str(_item_value(block, "evidence_role", "")).strip()
+        kind = str(_item_value(block, "kind", "")).strip()
+        if evidence_role != role and kind not in _ROLE_KIND_FALLBACK.get(role, set()):
+            continue
+        symbol = str(_item_value(block, "symbol", "")).strip()
+        if symbol:
+            return symbol
+    return ""
+
+
+def _first_matching_snippet(texts: list[str], pattern: re.Pattern[str]) -> str:
+    for text in texts:
+        for line in text.splitlines():
+            if pattern.search(line):
+                return line.strip()
+    return ""
+
+
+def _extract_deep_alloc_fields(text: str, *, limit: int = 3) -> list[str]:
+    fields: list[str] = []
+    for match in re.finditer(r"\.([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:new(?:\[\])?|malloc|calloc|realloc|strdup)", text, re.IGNORECASE):
+        field = match.group(1)
+        if field not in fields:
+            fields.append(field)
+        if len(fields) >= limit:
+            break
+    return fields
+
+
+def _line_for_diff_item(repo_root: Path, file_path: str, diff_item: dict[str, Any], needle: str = "") -> int | None:
+    if needle:
+        line = _find_line_in_repo(repo_root, file_path, needle)
+        if line is not None:
+            return line
+    changed_lines = [item for item in diff_item.get("changed_lines", []) if isinstance(item, int) and item > 0]
+    return min(changed_lines) if changed_lines else None
+
+
+def _build_generic_resource_finding(
+    *,
+    repo_root: Path,
+    plan: Any,
+    diff_item: dict[str, Any],
+    related_blocks: list[Any],
+) -> Finding | None:
+    bug_classes = {str(item).strip().lower() for item in _item_value(plan, "suspected_bug_classes", ())}
+    if not bug_classes.intersection({"resource_lifecycle", "ownership_mismatch"}):
+        return None
+
+    subject_path = str(_item_value(plan, "file", "")).strip()
+    patch = str(diff_item.get("patch", ""))
+    changed_symbols = guess_symbols_from_patch(patch, max_items=8)
+    entry_texts = _block_role_texts(related_blocks, "changed_entrypoint") + _block_role_texts(related_blocks, "local_changed_logic")
+    helper_texts = _block_role_texts(related_blocks, "helper_definition")
+    ownership_texts = _block_role_texts(related_blocks, "ownership_transfer_path")
+    cleanup_texts = _block_role_texts(related_blocks, "cleanup_path") + _block_role_texts(related_blocks, "destructor_or_clear")
+    sibling_texts = _block_role_texts(related_blocks, "sibling_baseline")
+
+    entry_joined = "\n\n".join(entry_texts + ownership_texts + [patch])
+    helper_joined = "\n\n".join(helper_texts)
+    cleanup_joined = "\n\n".join(cleanup_texts)
+    sibling_joined = "\n\n".join(sibling_texts)
+
+    has_ownership_intro = bool(_WRAPPER_OWNERSHIP_RE.search(entry_joined) and _ALLOC_OR_HELPER_RE.search(entry_joined + "\n" + helper_joined))
+    has_cleanup_baseline = bool(_CLEANUP_RE.search(sibling_joined) or _CLEANUP_RE.search(cleanup_joined))
+    current_path_lacks_cleanup = bool(entry_joined.strip()) and not _CLEANUP_RE.search(entry_joined)
+    has_deep_alloc = bool(_DEEP_FIELD_ALLOC_RE.search(helper_joined) or re.search(r"\b(pb2c|parse|decode|clone|create)\b", helper_joined, re.IGNORECASE))
+    has_outer_only_free = bool(_OUTER_ONLY_FREE_RE.search(helper_joined))
+
+    if not has_ownership_intro:
+        return None
+    if not has_cleanup_baseline:
+        return None
+    if not current_path_lacks_cleanup:
+        return None
+    if not (has_deep_alloc or has_outer_only_free):
+        return None
+
+    entry_symbol = (
+        _first_symbol_for_role(related_blocks, "changed_entrypoint")
+        or (changed_symbols[0] if changed_symbols else "")
+        or _first_symbol_for_role(related_blocks, "ownership_transfer_path")
+    )
+    sibling_symbol = _first_symbol_for_role(related_blocks, "sibling_baseline")
+    helper_symbol = _first_symbol_for_role(related_blocks, "helper_definition")
+
+    intro_snippet = _first_matching_snippet(entry_texts + ownership_texts + [patch], re.compile(r"(PtrArr|vector<|set[A-Z]|[A-Z]+_Set|pb2c|parse|decode|clone|create)", re.IGNORECASE))
+    cleanup_snippet = _first_matching_snippet(sibling_texts + cleanup_texts, _CLEANUP_RE)
+    helper_snippet = _first_matching_snippet(
+        helper_texts,
+        re.compile(r"\.[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:new(?:\[\])?|malloc|calloc|realloc|strdup)", re.IGNORECASE),
+    ) or _first_matching_snippet(
+        helper_texts,
+        re.compile(r"(ttsContent|missionDisplayPb|new(?:\[\])?|malloc|calloc|strdup|delete\[\])", re.IGNORECASE),
+    )
+    deep_fields = _extract_deep_alloc_fields(helper_joined)
+
+    evidence: list[str] = []
+    if intro_snippet:
+        evidence.append(
+            f"{entry_symbol or subject_path} 引入了新的资源/所有权桥接点：`{intro_snippet}`。"
+        )
+    else:
+        evidence.append(
+            f"{entry_symbol or subject_path} 在当前 diff 中新增了复杂对象/资源桥接链，且包含潜在所有权引入点。"
+        )
+
+    if cleanup_snippet:
+        baseline_prefix = f"sibling baseline `{sibling_symbol}`" if sibling_symbol else "相关清理链"
+        evidence.append(
+            f"{baseline_prefix} 中可以看到既有 cleanup 机制，例如：`{cleanup_snippet}`；但当前变更路径未复用对等的 save/release/pool/clear/destroy 机制。"
+        )
+    else:
+        evidence.append("仓库上下文里存在既有 cleanup/save/release/pool 链，但当前变更路径没有体现对等的接管或释放。")
+
+    if helper_snippet:
+        evidence.append(
+            f"{helper_symbol or 'helper/converter'} 显示存在隐式分配或深层字段资源，例如：`{helper_snippet}`。"
+        )
+    if deep_fields:
+        evidence.append(
+            f"helper/转换器为深层字段分配资源，至少包括：{', '.join(deep_fields)}。"
+        )
+    if has_outer_only_free:
+        evidence.append("相关容器/析构路径只释放外层数组或 wrapper，本身不足以证明元素内部深层字段会被一并释放。")
+
+    bug_class = "ownership_mismatch" if "ownership_mismatch" in bug_classes else "resource_lifecycle"
+    line = _line_for_diff_item(repo_root, subject_path, diff_item, entry_symbol)
+    message = (
+        f"{entry_symbol or '当前变更路径'} 引入了新的资源或复杂对象桥接，但没有同时接入仓库中已有的 cleanup/ownership transfer 机制。"
+    )
+    impact = (
+        "如果 helper/转换器为对象内部字段做了堆分配，而当前路径既没有显式接管，也没有进入既有的清理链，"
+        "这些深层资源会在正常请求路径上持续泄露或形成所有权错配。"
+    )
+    if has_outer_only_free and has_deep_alloc:
+        impact = (
+            "helper/转换器已经引入深层堆分配，而当前路径只看到外层容器生命周期，"
+            "没有看到对等的深层字段托管或释放；这会导致深层字段在高频调用链上持续泄露。"
+        )
+
+    return {
+        "language": str(diff_item.get("language", "")) or "cpp",
+        "tool": "llm_diff_review",
+        "source": "llm_diff_review",
+        "rule_id": "semantic-review",
+        "bug_class": bug_class,
+        "category": bug_class,
+        "severity": "medium",
+        "file": subject_path,
+        "line": line,
+        "column": None,
+        "title": f"{entry_symbol or '新增桥接路径'} 未接入对等的资源清理/所有权交接链",
+        "message": message,
+        "impact": impact,
+        "snippet": None,
+        "confidence": "high" if has_deep_alloc and has_cleanup_baseline else "medium",
+        "review_action": "should_fix",
+        "autofix_available": False,
+        "in_diff": True,
+        "evidence": evidence[:5],
+        "key_evidence_roles": [
+            role
+            for role in ("changed_entrypoint", "helper_definition", "ownership_transfer_path", "cleanup_path", "sibling_baseline")
+            if _block_role_texts(related_blocks, role)
+        ],
+        "evidence_completeness": "complete" if has_deep_alloc and has_cleanup_baseline and has_outer_only_free else "strong",
+        "key_evidence_summary": _summarize_key_evidence(evidence[:5]),
+        "suggested_action": (
+            f"让 {entry_symbol or '当前新路径'} 复用现有的 save/release/pool/clear/destroy 生命周期链，"
+            "或在新链路中显式接管并释放 helper 引入的深层资源。"
+        ),
+    }
+
+
+def _synthesize_bug_class_findings(
+    *,
+    repo_root: Path,
+    diff_file_map: dict[str, dict[str, Any]],
+    review_context_blocks: list[Any],
+    review_plans: list[Any],
+) -> list[Finding]:
+    synthesized: list[Finding] = []
+    for plan in review_plans:
+        subject_path = str(_item_value(plan, "file", "")).strip()
+        if not subject_path:
+            continue
+        diff_item = diff_file_map.get(subject_path)
+        if not diff_item:
+            continue
+        related_blocks = _related_context_blocks(review_context_blocks, file_path=subject_path)
+        generic_resource = _build_generic_resource_finding(
+            repo_root=repo_root,
+            plan=plan,
+            diff_item=diff_item,
+            related_blocks=related_blocks,
+        )
+        if generic_resource:
+            synthesized.append(generic_resource)
+    return synthesized
+
+
+def _merge_or_append_synthesized_findings(
+    findings: list[Finding],
+    synthesized: list[Finding],
+) -> list[Finding]:
+    if not synthesized:
+        return findings
+
+    merged_findings = list(findings)
+    for synthesized_item in synthesized:
+        matched = False
+        match_roles = set(_normalize_role_list(synthesized_item.get("key_evidence_roles")))
+        for index, finding in enumerate(merged_findings):
+            if str(finding.get("file", "")).strip() != str(synthesized_item.get("file", "")).strip():
+                continue
+            finding_roles = set(_normalize_role_list(finding.get("key_evidence_roles")))
+            if finding_roles and match_roles and finding_roles.intersection(match_roles):
+                merged = dict(finding)
+                merged["bug_class"] = str(synthesized_item.get("bug_class", "")) or str(merged.get("bug_class", ""))
+                if str(merged.get("category", "")).strip().lower() == "other":
+                    merged["category"] = synthesized_item["category"]
+                if str(merged.get("severity", "")).lower() not in {"critical", "high"}:
+                    merged["severity"] = synthesized_item["severity"]
+                if str(merged.get("review_action", "")).strip().lower() not in {"block", "should_fix"}:
+                    merged["review_action"] = synthesized_item["review_action"]
+                if str(merged.get("confidence", "")).strip().lower() != "high":
+                    merged["confidence"] = synthesized_item["confidence"]
+                merged["evidence_completeness"] = str(synthesized_item.get("evidence_completeness", "")) or str(merged.get("evidence_completeness", ""))
+                merged["key_evidence_roles"] = list(finding_roles.union(match_roles))
+                merged_evidence = _normalize_evidence(merged.get("evidence")) + _normalize_evidence(synthesized_item.get("evidence"))
+                deduped: list[str] = []
+                for item in merged_evidence:
+                    if item not in deduped:
+                        deduped.append(item)
+                merged["evidence"] = deduped[:6]
+                merged["key_evidence_summary"] = _summarize_key_evidence(deduped[:6])
+                if not str(merged.get("impact", "")).strip():
+                    merged["impact"] = str(synthesized_item.get("impact", ""))
+                if not str(merged.get("message", "")).strip():
+                    merged["message"] = str(synthesized_item.get("message", ""))
+                if not str(merged.get("title", "")).strip():
+                    merged["title"] = str(synthesized_item.get("title", ""))
+                merged_findings[index] = merged
+                matched = True
+                break
+        if not matched:
+            merged_findings.append(synthesized_item)
+    return merged_findings
+
+
 def _normalize_llm_review_finding(raw: dict[str, Any]) -> Finding:
     file_path = _norm_str(raw.get("file"))
     line = _norm_line(raw.get("line"))
@@ -623,12 +1055,22 @@ def _normalize_llm_review_finding(raw: dict[str, Any]) -> Finding:
     review_action = _norm_review_action(raw.get("review_action"), severity)
     confidence = _norm_confidence(raw.get("confidence"), severity)
     category = _norm_category(raw.get("category"))
+    bug_class = _norm_bug_class(raw.get("bug_class"), category)
+    if category == "other" and bug_class != "other":
+        category = bug_class
 
     message = _norm_str(raw.get("message"))
     impact = _norm_str(raw.get("impact"))
     title = _norm_str(raw.get("title")) or _default_title(message, category)
     suggested_action = _norm_str(raw.get("suggested_action"))
     evidence = _normalize_evidence(raw.get("evidence"))
+    key_evidence_roles = _normalize_role_list(raw.get("key_evidence_roles"))
+    evidence_completeness = _norm_evidence_completeness(
+        raw.get("evidence_completeness"),
+        bug_class=bug_class,
+        key_evidence_roles=key_evidence_roles,
+        evidence=evidence,
+    )
     language = _norm_str(raw.get("language")) or _infer_language_from_file(file_path)
 
     if not evidence and confidence == "high":
@@ -652,6 +1094,7 @@ def _normalize_llm_review_finding(raw: dict[str, Any]) -> Finding:
         "tool": "llm_diff_review",
         "source": "llm_diff_review",
         "rule_id": "semantic-review",
+        "bug_class": bug_class,
         "category": category,
         "severity": severity,  # type: ignore[typeddict-item]
         "file": file_path,
@@ -666,6 +1109,9 @@ def _normalize_llm_review_finding(raw: dict[str, Any]) -> Finding:
         "autofix_available": False,
         "in_diff": True,
         "evidence": evidence,
+        "key_evidence_roles": key_evidence_roles,
+        "evidence_completeness": evidence_completeness,
+        "key_evidence_summary": _summarize_key_evidence(evidence),
         "suggested_action": suggested_action,
     }
 
@@ -675,7 +1121,7 @@ def _normalize_review_findings(
     repo_root: Path,
     diff_paths: set[str],
     diff_file_map: dict[str, dict[str, Any]],
-    review_context_blocks: list[dict[str, Any]],
+    review_context_blocks: list[Any],
 ) -> tuple[list[Finding], int]:
     findings_raw = parsed.get("findings", [])
     if not isinstance(findings_raw, list):
@@ -760,6 +1206,7 @@ def review_diff_with_llm(state: GraphState) -> GraphState:
     diff_paths = {str(item.get("path", "")) for item in diff_files if item.get("path")}
     diff_file_map = {str(item.get("path", "")): item for item in diff_files if item.get("path")}
     extra_context_blocks = list(state.get("review_context_blocks", []))
+    review_plans = list(state.get("review_plans", []))
     messages = build_diff_review_messages(
         repo_name=repo_name,
         base_ref=base_ref,
@@ -772,15 +1219,23 @@ def review_diff_with_llm(state: GraphState) -> GraphState:
             max_items=max_static_findings,
         ),
         extra_context_blocks=extra_context_blocks,
+        retrieval_plans=review_plans,
         max_findings=max_findings,
     )
 
     try:
         raw_text = _call_llm_diff_review(messages, state)
     except Exception as e:  # noqa: BLE001
-        state["llm_review_findings"] = []
+        synthesized_findings = _synthesize_bug_class_findings(
+            repo_root=repo_root,
+            diff_file_map=diff_file_map,
+            review_context_blocks=extra_context_blocks,
+            review_plans=review_plans,
+        )
+        state["llm_review_findings"] = synthesized_findings
         state.setdefault("logs", []).append(
-            f"review_diff_with_llm: fallback_empty, diff_blocks={len(diff_blocks)}, error_type={type(e).__name__}"
+            "review_diff_with_llm: "
+            f"fallback_empty, diff_blocks={len(diff_blocks)}, error_type={type(e).__name__}, synthesized={len(synthesized_findings)}"
         )
         _append_error(
             state,
@@ -790,9 +1245,15 @@ def review_diff_with_llm(state: GraphState) -> GraphState:
 
     parsed = _extract_json_text(raw_text)
     if not parsed:
-        state["llm_review_findings"] = []
+        synthesized_findings = _synthesize_bug_class_findings(
+            repo_root=repo_root,
+            diff_file_map=diff_file_map,
+            review_context_blocks=extra_context_blocks,
+            review_plans=review_plans,
+        )
+        state["llm_review_findings"] = synthesized_findings
         state.setdefault("logs", []).append(
-            f"review_diff_with_llm: parse_failed, diff_blocks={len(diff_blocks)}"
+            f"review_diff_with_llm: parse_failed, diff_blocks={len(diff_blocks)}, synthesized={len(synthesized_findings)}"
         )
         _append_error(state, "review_diff_with_llm: response JSON parse failed")
         return state
@@ -804,9 +1265,16 @@ def review_diff_with_llm(state: GraphState) -> GraphState:
         diff_file_map,
         extra_context_blocks,
     )
+    synthesized_findings = _synthesize_bug_class_findings(
+        repo_root=repo_root,
+        diff_file_map=diff_file_map,
+        review_context_blocks=extra_context_blocks,
+        review_plans=review_plans,
+    )
+    findings = _merge_or_append_synthesized_findings(findings, synthesized_findings)
     state["llm_review_findings"] = findings
     state.setdefault("logs", []).append(
         "review_diff_with_llm: "
-        f"reviewed_files={len(changed_files)}, diff_blocks={len(diff_blocks)}, findings={len(findings)}, dropped={dropped}"
+        f"reviewed_files={len(changed_files)}, diff_blocks={len(diff_blocks)}, findings={len(findings)}, dropped={dropped}, synthesized={len(synthesized_findings)}"
     )
     return state

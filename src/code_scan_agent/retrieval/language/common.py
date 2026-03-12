@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
@@ -13,11 +14,16 @@ def normalize_path(path: str | Path) -> str:
     return str(path).replace("\\", "/").lstrip("./")
 
 
-def read_file_text(path: str | Path) -> str:
+@lru_cache(maxsize=4096)
+def _read_file_text_cached(path: str) -> str:
     try:
         return Path(path).read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
+
+
+def read_file_text(path: str | Path) -> str:
+    return _read_file_text_cached(str(Path(path)))
 
 
 def safe_slice_lines(text: str, start: int, end: int) -> str:
@@ -36,7 +42,16 @@ def line_to_offset(text: str, line_no: int) -> int:
     return sum(len(line) for line in lines[: max(line_no - 1, 0)])
 
 
-def trim_block(text: str, max_chars: int = 1600) -> str:
+def trim_block(text: str, max_chars: int = 1600, max_lines: int | None = None) -> str:
+    if max_lines is not None and max_lines > 0:
+        lines = text.splitlines()
+        if len(lines) > max_lines:
+            omitted_lines = len(lines) - max_lines
+            keep_head = max_lines // 2
+            keep_tail = max_lines - keep_head
+            head = lines[:keep_head]
+            tail = lines[-keep_tail:] if keep_tail else []
+            text = "\n".join(head + [f"... {omitted_lines} lines omitted ..."] + tail)
     if len(text) <= max_chars:
         return text
     head = max_chars // 2
@@ -90,20 +105,27 @@ def extract_line_window(text: str, line_no: int, *, before: int = 12, after: int
 
 
 def iter_repo_files(repo_path: Path, suffixes: Iterable[str] | None = None) -> list[Path]:
-    suffix_set = {item.lower() for item in suffixes or []}
-    paths: list[Path] = []
+    suffix_tuple = tuple(sorted(item.lower() for item in (suffixes or [])))
+    return [Path(item) for item in _iter_repo_files_cached(str(repo_path), suffix_tuple)]
+
+
+@lru_cache(maxsize=64)
+def _iter_repo_files_cached(repo_path: str, suffixes: tuple[str, ...]) -> tuple[str, ...]:
+    suffix_set = set(suffixes)
+    repo_root = Path(repo_path)
+    paths: list[str] = []
     try:
-        for path in repo_path.rglob("*"):
+        for path in repo_root.rglob("*"):
             if not path.is_file():
                 continue
             if any(part in _SKIP_DIRS for part in path.parts):
                 continue
             if suffix_set and path.suffix.lower() not in suffix_set:
                 continue
-            paths.append(path)
+            paths.append(str(path))
     except Exception:
-        return []
-    return paths
+        return ()
+    return tuple(paths)
 
 
 def find_matching_brace_end(lines: list[str], brace_line: int) -> int | None:
@@ -147,6 +169,9 @@ def extract_enclosing_block(
                 match = pattern.search(snippet)
                 if match:
                     matched_symbol = str(match.groupdict().get("symbol", "")).strip()
+                    if matched_symbol in _CONTROL_KEYWORDS:
+                        matched_symbol = ""
+                        continue
                     matched = True
                     break
             if not matched:

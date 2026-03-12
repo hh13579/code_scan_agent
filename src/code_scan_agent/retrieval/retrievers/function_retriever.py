@@ -9,18 +9,18 @@ from code_scan_agent.retrieval.language.java_context import find_function_contex
 from code_scan_agent.retrieval.language.ts_context import find_function_context as find_ts_function_context
 
 
-def retrieve_function_context(
+def get_function_context(
     *,
     repo_path: str | Path,
     file: str,
     language: str,
     changed_lines: list[int],
-) -> list[dict[str, Any]]:
+) -> dict[str, Any] | None:
     repo_root = Path(repo_path).resolve()
     abs_path = (repo_root / file).resolve()
     text = read_file_text(abs_path)
     if not text:
-        return []
+        return None
 
     finder = {
         "cpp": find_cpp_function_context,
@@ -62,25 +62,36 @@ def retrieve_function_context(
                     -int(item.get("_start_line", 0)),
                 )
             )
-            out: list[dict[str, Any]] = []
-            for item in block_candidates[:2]:
-                normalized = dict(item)
-                normalized.pop("_covered_count", None)
-                normalized.pop("_start_line", None)
-                out.append(normalized)
-            return out
+            normalized = dict(block_candidates[0])
+            normalized.pop("_covered_count", None)
+            normalized.pop("_start_line", None)
+            return normalized
 
     if changed_lines:
         target_line = min(line for line in changed_lines if isinstance(line, int) and line > 0)
         fallback = safe_slice_lines(text, target_line - 30, target_line + 30)
         if fallback:
-            return [
-                {
-                    "file": normalize_path(file),
-                    "kind": "function_context",
-                    "symbol": "",
-                    "content": trim_block(fallback, max_chars=2200),
-                }
-            ]
+            return {
+                "file": normalize_path(file),
+                "kind": "function_context",
+                "symbol": "",
+                "content": trim_block(fallback, max_chars=2200),
+            }
 
-    return []
+    return None
+
+
+def retrieve_function_context(
+    *,
+    repo_path: str | Path,
+    file: str,
+    language: str,
+    changed_lines: list[int],
+) -> list[dict[str, Any]]:
+    block = get_function_context(
+        repo_path=repo_path,
+        file=file,
+        language=language,
+        changed_lines=changed_lines,
+    )
+    return [block] if block else []
